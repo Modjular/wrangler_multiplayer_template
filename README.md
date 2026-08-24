@@ -1,13 +1,15 @@
 # Multiplayer Game — MVP
 
 Browser multiplayer for friends: host starts a session, shares a link, everyone
-picks a username and drops into a shared three.js room. See
-`multiplayer-game-spec.md` for the full design.
+picks a username and drops into a shared three.js room.
 
 ## Requirements
 - Node (via `nvm`) — this project was set up against Node 25, but anything
   reasonably recent should work
-- No Cloudflare account needed for local dev (only for deploying)
+- That's it. `wrangler` is a devDependency in `package.json`, not a global
+  install — `npm install` pulls it in, and `npm run dev` runs the local copy
+  (`npx wrangler dev` under the hood). No Cloudflare account needed for local
+  dev (only for deploying).
 
 ## Setup
 
