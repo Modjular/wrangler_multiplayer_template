@@ -25,9 +25,23 @@ export class GameRoom {
   }
 
   async fetch(request) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/register" && request.method === "POST") {
+      await this.state.storage.put("exists", true);
+      await this.state.storage.delete("closed");
+      return new Response("ok");
+    }
+
     const upgradeHeader = request.headers.get("Upgrade");
     if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
       return new Response("Expected WebSocket upgrade", { status: 426 });
+    }
+
+    const exists = await this.state.storage.get("exists");
+    const closed = await this.state.storage.get("closed");
+    if (!exists || closed) {
+      return new Response("Session not found or has ended", { status: 404 });
     }
 
     const pair = new WebSocketPair();
@@ -53,11 +67,11 @@ export class GameRoom {
     });
 
     ws.addEventListener("close", () => {
-      this.onDisconnect(playerId);
+      this.onDisconnect(playerId).catch(() => {});
     });
 
     ws.addEventListener("error", () => {
-      this.onDisconnect(playerId);
+      this.onDisconnect(playerId).catch(() => {});
     });
   }
 
@@ -66,6 +80,14 @@ export class GameRoom {
 
     switch (msg.type) {
       case "join": {
+        if (this.status === "playing") {
+          ws.send(
+            JSON.stringify({ type: "error", message: "Game already in progress." })
+          );
+          ws.close(4000, "game already started");
+          return;
+        }
+
         const shape = SHAPES[this.players.size % SHAPES.length];
         const player = {
           id: playerId,
@@ -122,7 +144,7 @@ export class GameRoom {
     }
   }
 
-  onDisconnect(playerId) {
+  async onDisconnect(playerId) {
     const wasHost = playerId === this.hostId;
     this.players.delete(playerId);
 
@@ -131,10 +153,18 @@ export class GameRoom {
       this.hostId = next.done ? null : next.value;
     }
 
+    if (this.players.size === 0) {
+      this.status = "lobby";
+      this.hostId = null;
+      await this.state.storage.put("closed", true);
+      await this.state.storage.deleteAlarm();
+      return;
+    }
+
     if (this.status === "lobby") {
       this.broadcastLobby();
     } else {
-      this.broadcast({ type: "player_left", id: playerId });
+      this.broadcast({ type: "player_left", id: playerId, hostId: this.hostId });
     }
   }
 
@@ -189,5 +219,6 @@ export class GameRoom {
     this.players.clear();
     this.status = "lobby";
     this.hostId = null;
+    await this.state.storage.put("closed", true);
   }
 }

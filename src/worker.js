@@ -17,6 +17,10 @@ export default {
 
     if (url.pathname === "/api/session/new" && request.method === "POST") {
       const sessionId = generateSessionId();
+      const id = env.GAME_ROOM.idFromName(sessionId);
+      const stub = env.GAME_ROOM.get(id);
+      await stub.fetch("https://game-room/register", { method: "POST" });
+
       return Response.json({
         sessionId,
         url: `${url.origin}/join.html?session=${sessionId}`,

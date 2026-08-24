@@ -98,3 +98,19 @@ input[type="text"] {
   color: #aaa;
   font-size: 0.9rem;
 }
+
+.leave-btn {
+  background: #3a3d4d;
+  margin-top: 0.75rem;
+}
+
+.leave-btn:hover {
+  background: #4a4d63;
+}
+
+.leave-btn-game {
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  z-index: 10;
+}
