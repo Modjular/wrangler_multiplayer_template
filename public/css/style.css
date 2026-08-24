@@ -1,0 +1,100 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #14161f;
+  color: #eee;
+}
+
+.container {
+  max-width: 480px;
+  margin: 10vh auto;
+  padding: 2rem;
+  text-align: center;
+}
+
+h1 {
+  margin-bottom: 1.5rem;
+}
+
+button {
+  font-size: 1rem;
+  padding: 0.6rem 1.2rem;
+  border-radius: 8px;
+  border: none;
+  background: #5865f2;
+  color: white;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #4752c4;
+}
+
+button:disabled {
+  background: #3a3d4d;
+  cursor: not-allowed;
+}
+
+input[type="text"] {
+  font-size: 1rem;
+  padding: 0.6rem;
+  border-radius: 8px;
+  border: 1px solid #444;
+  background: #1e202b;
+  color: #eee;
+  width: 100%;
+  margin-bottom: 1rem;
+}
+
+#share-box {
+  margin-top: 1.5rem;
+  display: none;
+}
+
+#share-link {
+  width: 100%;
+  padding: 0.5rem;
+  background: #1e202b;
+  color: #eee;
+  border: 1px solid #444;
+  border-radius: 8px;
+  margin-bottom: 0.5rem;
+}
+
+#player-list {
+  list-style: none;
+  padding: 0;
+  margin: 1rem 0;
+  text-align: left;
+}
+
+#player-list li {
+  padding: 0.4rem 0.6rem;
+  background: #1e202b;
+  border-radius: 6px;
+  margin-bottom: 0.4rem;
+}
+
+#player-list li.host::after {
+  content: " (host)";
+  color: #8a8fbf;
+  font-size: 0.85em;
+}
+
+#game-canvas {
+  display: none;
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+}
+
+#status-msg {
+  margin-top: 1rem;
+  color: #aaa;
+  font-size: 0.9rem;
+}

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Multiplayer Game</title>
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Multiplayer Game</h1>
+    <button id="start-btn">Start New Session</button>
+
+    <div id="share-box">
+      <p>Share this link with friends:</p>
+      <input id="share-link" type="text" readonly />
+      <button id="copy-btn">Copy Link</button>
+      <p><a id="join-link" href="#" style="color:#8a8fbf">Go to lobby &rarr;</a></p>
+    </div>
+
+    <p id="status-msg"></p>
+  </div>
+
+  <script>
+    const startBtn = document.getElementById("start-btn");
+    const shareBox = document.getElementById("share-box");
+    const shareLink = document.getElementById("share-link");
+    const copyBtn = document.getElementById("copy-btn");
+    const joinLink = document.getElementById("join-link");
+    const statusMsg = document.getElementById("status-msg");
+
+    startBtn.addEventListener("click", async () => {
+      startBtn.disabled = true;
+      statusMsg.textContent = "Creating session...";
+      try {
+        const res = await fetch("/api/session/new", { method: "POST" });
+        if (!res.ok) throw new Error("request failed");
+        const { sessionId, url } = await res.json();
+        shareLink.value = url;
+        joinLink.href = `/join.html?session=${sessionId}`;
+        shareBox.style.display = "block";
+        statusMsg.textContent = "";
+      } catch (err) {
+        statusMsg.textContent = "Failed to create session. Try again.";
+      } finally {
+        startBtn.disabled = false;
+      }
+    });
+
+    copyBtn.addEventListener("click", async () => {
+      await navigator.clipboard.writeText(shareLink.value);
+      copyBtn.textContent = "Copied!";
+      setTimeout(() => (copyBtn.textContent = "Copy Link"), 1500);
+    });
+  </script>
+</body>
+</html>

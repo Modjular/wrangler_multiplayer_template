@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lobby — Multiplayer Game</title>
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+  <div class="container" id="lobby">
+    <h1>Waiting Room</h1>
+
+    <div id="join-form">
+      <input id="username-input" type="text" placeholder="Enter a username" maxlength="20" />
+      <button id="join-btn">Join</button>
+    </div>
+
+    <div id="lobby-view" style="display:none">
+      <h3>Players</h3>
+      <ul id="player-list"></ul>
+      <button id="start-btn" style="display:none">Start Game</button>
+    </div>
+
+    <p id="status-msg"></p>
+  </div>
+
+  <canvas id="game-canvas"></canvas>
+
+  <script type="module" src="/js/lobby.js"></script>
+</body>
+</html>
