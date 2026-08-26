@@ -1,6 +1,14 @@
 const SHAPES = ["cube", "sphere", "cone", "cylinder", "torus"];
 const IDLE_MS = 5 * 60 * 1000;
 
+// Fixed broadcast tick rate while playing, independent of when inputs arrive.
+// A steady cadence gives clients evenly-spaced snapshots to interpolate
+// between, instead of jittery bursts tied to however often players happen to
+// send input. Must stay comfortably below public/js/game.js's
+// INTERP_DELAY_MS so at least one fresh tick lands inside that window.
+const TICK_HZ = 20;
+const TICK_MS = 1000 / TICK_HZ;
+
 // Half-height of each shape's geometry, i.e. the y a mesh needs to rest on
 // the ground plane. Must match public/js/game.js's SHAPE_REST_Y.
 const SHAPE_REST_Y = {
@@ -22,6 +30,7 @@ export class GameRoom {
     this.players = new Map(); // playerId -> { id, username, shape, x, y, z, rotY, ws }
     this.status = "lobby";
     this.hostId = null;
+    this.tickInterval = null;
   }
 
   async fetch(request) {
@@ -122,6 +131,7 @@ export class GameRoom {
             shape: p.shape,
           })),
         });
+        this.startTick();
         break;
       }
 
@@ -132,7 +142,6 @@ export class GameRoom {
         player.y = Number(msg.y) || 0;
         player.z = Number(msg.z) || 0;
         player.rotY = Number(msg.rotY) || 0;
-        this.broadcastState();
         break;
       }
 
@@ -156,6 +165,7 @@ export class GameRoom {
     if (this.players.size === 0) {
       this.status = "lobby";
       this.hostId = null;
+      this.stopTick();
       await this.state.storage.put("closed", true);
       await this.state.storage.deleteAlarm();
       return;
@@ -177,6 +187,17 @@ export class GameRoom {
       })),
       hostId: this.hostId,
     });
+  }
+
+  startTick() {
+    if (this.tickInterval) return;
+    this.tickInterval = setInterval(() => this.broadcastState(), TICK_MS);
+  }
+
+  stopTick() {
+    if (!this.tickInterval) return;
+    clearInterval(this.tickInterval);
+    this.tickInterval = null;
   }
 
   broadcastState() {
@@ -219,6 +240,7 @@ export class GameRoom {
     this.players.clear();
     this.status = "lobby";
     this.hostId = null;
+    this.stopTick();
     await this.state.storage.put("closed", true);
   }
 }

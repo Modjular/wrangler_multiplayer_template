@@ -23,6 +23,45 @@ const SHAPE_REST_Y = {
 const MOVE_SPEED = 4; // units/sec
 const INPUT_SEND_HZ = 15;
 
+// Remote players are rendered this far in the past so we always have two
+// real buffered snapshots to interpolate between, smoothing over network
+// jitter instead of chasing the latest sample as it arrives unevenly.
+const INTERP_DELAY_MS = 100;
+const BUFFER_MAX_AGE_MS = 1000;
+
+function shortestAngleDelta(from, to) {
+  const twoPi = Math.PI * 2;
+  const delta = (to - from) % twoPi;
+  return ((2 * delta) % twoPi) - delta;
+}
+
+// Interpolates a remote player's buffered snapshots to render at `renderTime`
+// (a timestamp slightly in the past), rather than snapping to the latest
+// sample as it arrives — smooths over uneven network jitter.
+function sampleBuffer(buffer, renderTime) {
+  const first = buffer[0];
+  const last = buffer[buffer.length - 1];
+
+  if (renderTime <= first.t) return first;
+  if (renderTime >= last.t) return last;
+
+  for (let i = 0; i < buffer.length - 1; i++) {
+    const a = buffer[i];
+    const b = buffer[i + 1];
+    if (renderTime >= a.t && renderTime <= b.t) {
+      const span = b.t - a.t;
+      const factor = span > 0 ? (renderTime - a.t) / span : 1;
+      return {
+        x: a.x + (b.x - a.x) * factor,
+        y: a.y + (b.y - a.y) * factor,
+        z: a.z + (b.z - a.z) * factor,
+        rotY: a.rotY + shortestAngleDelta(a.rotY, b.rotY) * factor,
+      };
+    }
+  }
+  return last;
+}
+
 export function startGame({ ws, players, myId }) {
   const canvas = document.getElementById("game-canvas");
 
@@ -54,7 +93,7 @@ export function startGame({ ws, players, myId }) {
   ground.rotation.x = -Math.PI / 2;
   scene.add(ground);
 
-  const meshes = new Map(); // playerId -> { mesh, target: {x,y,z,rotY} }
+  const meshes = new Map(); // playerId -> { mesh, target, buffer: [{t,x,y,z,rotY}] }
 
   players.forEach((p, i) => {
     const geometry = (SHAPE_GEOMETRIES[p.shape] || SHAPE_GEOMETRIES.cube)();
@@ -65,19 +104,26 @@ export function startGame({ ws, players, myId }) {
     const restY = SHAPE_REST_Y[p.shape] ?? 0.6;
     mesh.position.set(0, restY, 0);
     scene.add(mesh);
-    meshes.set(p.id, { mesh, target: { x: 0, y: restY, z: 0, rotY: 0 } });
+    meshes.set(p.id, {
+      mesh,
+      target: { x: 0, y: restY, z: 0, rotY: 0 },
+      buffer: [{ t: performance.now(), x: 0, y: restY, z: 0, rotY: 0 }],
+    });
   });
 
   ws.addEventListener("message", (event) => {
     const msg = JSON.parse(event.data);
     if (msg.type === "state_update") {
+      const now = performance.now();
       for (const p of msg.players) {
+        if (p.id === myId) continue; // don't override local prediction
         const entry = meshes.get(p.id);
         if (!entry) continue;
-        entry.target.x = p.x;
-        entry.target.y = p.y;
-        entry.target.z = p.z;
-        entry.target.rotY = p.rotY;
+        entry.buffer.push({ t: now, x: p.x, y: p.y, z: p.z, rotY: p.rotY });
+        const cutoff = now - BUFFER_MAX_AGE_MS;
+        while (entry.buffer.length > 2 && entry.buffer[1].t < cutoff) {
+          entry.buffer.shift();
+        }
       }
     } else if (msg.type === "player_left") {
       const entry = meshes.get(msg.id);
@@ -158,13 +204,12 @@ export function startGame({ ws, players, myId }) {
       }
     }
 
+    const renderTime = now - INTERP_DELAY_MS;
     for (const [id, entry] of meshes) {
       if (id === myId) continue;
-      entry.mesh.position.lerp(
-        new THREE.Vector3(entry.target.x, entry.target.y, entry.target.z),
-        0.3
-      );
-      entry.mesh.rotation.y += (entry.target.rotY - entry.mesh.rotation.y) * 0.3;
+      const snap = sampleBuffer(entry.buffer, renderTime);
+      entry.mesh.position.set(snap.x, snap.y, snap.z);
+      entry.mesh.rotation.y = snap.rotY;
     }
 
     renderer.render(scene, camera);
