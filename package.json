@@ -1,10 +1,11 @@
 {
   "name": "20260824_impasta",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "description": "",
   "main": "index.js",
   "scripts": {
     "dev": "wrangler dev",
+    "predeploy": "node scripts/bump-version.mjs",
     "deploy": "wrangler deploy"
   },
   "keywords": [],

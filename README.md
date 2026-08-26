@@ -55,6 +55,14 @@ npx wrangler login   # one-time Cloudflare auth
 npm run deploy
 ```
 
+**Use `npm run deploy`, not `npx wrangler deploy` directly** — the former
+auto-bumps the patch version (`scripts/bump-version.mjs`, wired via a
+`predeploy` hook) and writes it to `public/version.json`, which shows up as a
+small `vX.Y.Z` badge in the bottom-right corner of every page
+(`public/js/version-badge.js`). It's a quick sanity check that a deploy
+actually landed. Running `wrangler deploy` on its own skips the bump, so the
+badge will look stale even though the deploy succeeded.
+
 ## Project layout
 
 ```
