@@ -26,8 +26,14 @@ const INPUT_SEND_HZ = 15;
 // Remote players are rendered this far in the past so we always have two
 // real buffered snapshots to interpolate between, smoothing over network
 // jitter instead of chasing the latest sample as it arrives unevenly.
-const INTERP_DELAY_MS = 100;
+const INTERP_DELAY_MS = 180;
 const BUFFER_MAX_AGE_MS = 1000;
+
+// If the buffer runs dry (a jitter spike delays the next real snapshot past
+// our interpolation window), extrapolate forward from the last known
+// velocity instead of freezing in place — capped so a prolonged stall still
+// settles rather than sliding a mesh off indefinitely on a bad guess.
+const MAX_EXTRAPOLATION_MS = 250;
 
 function shortestAngleDelta(from, to) {
   const twoPi = Math.PI * 2;
@@ -43,7 +49,25 @@ function sampleBuffer(buffer, renderTime) {
   const last = buffer[buffer.length - 1];
 
   if (renderTime <= first.t) return first;
-  if (renderTime >= last.t) return last;
+
+  if (renderTime > last.t) {
+    const prev = buffer.length >= 2 ? buffer[buffer.length - 2] : null;
+    if (!prev || prev.t === last.t) return last;
+
+    const overrun = Math.min(renderTime - last.t, MAX_EXTRAPOLATION_MS);
+    const span = last.t - prev.t;
+    const vx = (last.x - prev.x) / span;
+    const vy = (last.y - prev.y) / span;
+    const vz = (last.z - prev.z) / span;
+    const vRot = shortestAngleDelta(prev.rotY, last.rotY) / span;
+
+    return {
+      x: last.x + vx * overrun,
+      y: last.y + vy * overrun,
+      z: last.z + vz * overrun,
+      rotY: last.rotY + vRot * overrun,
+    };
+  }
 
   for (let i = 0; i < buffer.length - 1; i++) {
     const a = buffer[i];
