@@ -84,7 +84,13 @@ function handleMessage(msg) {
       canvas.style.display = "block";
       leaveBtnGame.style.display = "inline-block";
       import("/js/game.js").then((mod) => {
-        mod.startGame({ ws, players: msg.players, myId });
+        mod.startGame({
+          ws,
+          players: msg.players,
+          myId,
+          spawns: msg.spawns,
+          seed: msg.seed,
+        });
       });
       break;
     }

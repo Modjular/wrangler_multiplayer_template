@@ -1,39 +1,25 @@
 import * as THREE from "https://unpkg.com/three@0.169.0/build/three.module.js";
-
-const SHAPE_GEOMETRIES = {
-  cube: () => new THREE.BoxGeometry(1, 1, 1),
-  sphere: () => new THREE.SphereGeometry(0.6, 24, 16),
-  cone: () => new THREE.ConeGeometry(0.6, 1.2, 24),
-  cylinder: () => new THREE.CylinderGeometry(0.5, 0.5, 1.2, 24),
-  torus: () => new THREE.TorusGeometry(0.5, 0.2, 16, 32),
-};
+import {
+  GRID_SIZE,
+  CELL_SIZE,
+  createSimulation,
+  applyCommand,
+  step,
+  snapshot,
+} from "./sim.js";
 
 const COLORS = [0xff6b6b, 0x4ecdc4, 0xffe66d, 0x95e1d3, 0xa78bfa];
 
-// Half-height of each shape's geometry, i.e. the y a mesh needs to rest on
-// the ground plane. Must match src/GameRoom.js's SHAPE_REST_Y.
-const SHAPE_REST_Y = {
-  cube: 0.5,
-  sphere: 0.6,
-  cone: 0.6,
-  cylinder: 0.6,
-  torus: 0.7,
-};
+const TICK_MS = 50; // 20Hz fixed simulation step, decoupled from render rate
+const MAX_FRAME_DELTA_MS = 250; // clamp a single rAF gap (e.g. tab refocus)
+const MAX_ACCUMULATOR_MS = 1000; // cap catch-up so a long stall doesn't freeze the tab
 
-const MOVE_SPEED = 4; // units/sec
-const INPUT_SEND_HZ = 15;
-
-// Remote players are rendered this far in the past so we always have two
-// real buffered snapshots to interpolate between, smoothing over network
-// jitter instead of chasing the latest sample as it arrives unevenly.
-const INTERP_DELAY_MS = 180;
-const BUFFER_MAX_AGE_MS = 1000;
-
-// If the buffer runs dry (a jitter spike delays the next real snapshot past
-// our interpolation window), extrapolate forward from the last known
-// velocity instead of freezing in place — capped so a prolonged stall still
-// settles rather than sliding a mesh off indefinitely on a bad guess.
-const MAX_EXTRAPOLATION_MS = 250;
+const PLAYER_RADIUS = 0.35;
+const PLAYER_LENGTH = 0.6;
+const PLAYER_REST_Y = PLAYER_LENGTH / 2 + PLAYER_RADIUS;
+const CUBE_SIZE = 0.8;
+const CUBE_REST_Y = CUBE_SIZE / 2;
+const CARRY_HEIGHT = PLAYER_REST_Y + PLAYER_LENGTH / 2 + CUBE_SIZE / 2 + 0.1;
 
 function shortestAngleDelta(from, to) {
   const twoPi = Math.PI * 2;
@@ -41,65 +27,37 @@ function shortestAngleDelta(from, to) {
   return ((2 * delta) % twoPi) - delta;
 }
 
-// Interpolates a remote player's buffered snapshots to render at `renderTime`
-// (a timestamp slightly in the past), rather than snapping to the latest
-// sample as it arrives — smooths over uneven network jitter.
-function sampleBuffer(buffer, renderTime) {
-  const first = buffer[0];
-  const last = buffer[buffer.length - 1];
-
-  if (renderTime <= first.t) return first;
-
-  if (renderTime > last.t) {
-    const prev = buffer.length >= 2 ? buffer[buffer.length - 2] : null;
-    if (!prev || prev.t === last.t) return last;
-
-    const overrun = Math.min(renderTime - last.t, MAX_EXTRAPOLATION_MS);
-    const span = last.t - prev.t;
-    const vx = (last.x - prev.x) / span;
-    const vy = (last.y - prev.y) / span;
-    const vz = (last.z - prev.z) / span;
-    const vRot = shortestAngleDelta(prev.rotY, last.rotY) / span;
-
-    return {
-      x: last.x + vx * overrun,
-      y: last.y + vy * overrun,
-      z: last.z + vz * overrun,
-      rotY: last.rotY + vRot * overrun,
-    };
-  }
-
-  for (let i = 0; i < buffer.length - 1; i++) {
-    const a = buffer[i];
-    const b = buffer[i + 1];
-    if (renderTime >= a.t && renderTime <= b.t) {
-      const span = b.t - a.t;
-      const factor = span > 0 ? (renderTime - a.t) / span : 1;
-      return {
-        x: a.x + (b.x - a.x) * factor,
-        y: a.y + (b.y - a.y) * factor,
-        z: a.z + (b.z - a.z) * factor,
-        rotY: a.rotY + shortestAngleDelta(a.rotY, b.rotY) * factor,
-      };
-    }
-  }
-  return last;
+function lerpAngle(from, to, t) {
+  return from + shortestAngleDelta(from, to) * t;
 }
 
-export function startGame({ ws, players, myId }) {
+export function startGame({ ws, players, myId, spawns, seed }) {
   const canvas = document.getElementById("game-canvas");
 
+  // ---- deterministic simulation --------------------------------------
+  const simPlayers = players.map((p) => ({
+    id: p.id,
+    x: spawns[p.id].x,
+    z: spawns[p.id].z,
+  }));
+  const sim = createSimulation({ seed, players: simPlayers });
+  window.__sim = sim; // debug/test hook: inspect live sim state from devtools
+  window.__ws = ws; // debug/test hook: send raw commands from devtools
+
+  // ---- scene ------------------------------------------------------------
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x1a1c26);
 
+  const mapExtent = (GRID_SIZE * CELL_SIZE) / 2;
   const camera = new THREE.PerspectiveCamera(
-    60,
+    50,
     window.innerWidth / window.innerHeight,
     0.1,
     1000
   );
-  camera.position.set(0, 12, 10);
+  camera.position.set(0, mapExtent * 1.1, mapExtent * 0.95);
   camera.lookAt(0, 0, 0);
+  window.__camera = camera; // debug/test hook: reproject world -> screen coords
 
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setSize(window.innerWidth, window.innerHeight);
@@ -111,134 +69,236 @@ export function startGame({ ws, players, myId }) {
   scene.add(dirLight);
 
   const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(40, 40),
+    new THREE.PlaneGeometry(GRID_SIZE * CELL_SIZE, GRID_SIZE * CELL_SIZE),
     new THREE.MeshStandardMaterial({ color: 0x2a2d3a })
   );
   ground.rotation.x = -Math.PI / 2;
   scene.add(ground);
 
-  const meshes = new Map(); // playerId -> { mesh, target, buffer: [{t,x,y,z,rotY}] }
+  const gridHelper = new THREE.GridHelper(GRID_SIZE * CELL_SIZE, GRID_SIZE, 0x44485a, 0x333644);
+  gridHelper.position.y = 0.01;
+  scene.add(gridHelper);
 
-  players.forEach((p, i) => {
-    const geometry = (SHAPE_GEOMETRIES[p.shape] || SHAPE_GEOMETRIES.cube)();
+  // ---- player meshes ------------------------------------------------------
+  const colorIndexById = new Map(players.map((p) => [p.id, p.colorIndex]));
+  const playerMeshes = new Map(); // playerId -> mesh
+
+  for (const p of players) {
+    const geometry = new THREE.CapsuleGeometry(PLAYER_RADIUS, PLAYER_LENGTH, 4, 8);
     const material = new THREE.MeshStandardMaterial({
-      color: COLORS[i % COLORS.length],
+      color: COLORS[colorIndexById.get(p.id) % COLORS.length],
     });
     const mesh = new THREE.Mesh(geometry, material);
-    const restY = SHAPE_REST_Y[p.shape] ?? 0.6;
-    mesh.position.set(0, restY, 0);
+    const s = sim.players.get(p.id);
+    mesh.position.set(s.x, PLAYER_REST_Y, s.z);
     scene.add(mesh);
-    meshes.set(p.id, {
-      mesh,
-      target: { x: 0, y: restY, z: 0, rotY: 0 },
-      buffer: [{ t: performance.now(), x: 0, y: restY, z: 0, rotY: 0 }],
-    });
-  });
+    playerMeshes.set(p.id, mesh);
+  }
+
+  const myMarker = new THREE.Mesh(
+    new THREE.RingGeometry(PLAYER_RADIUS + 0.15, PLAYER_RADIUS + 0.25, 24),
+    new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide })
+  );
+  myMarker.rotation.x = -Math.PI / 2;
+  myMarker.position.y = 0.02;
+  scene.add(myMarker);
+
+  // ---- cube meshes ----------------------------------------------------
+  const cubeMeshes = new Map(); // cubeId -> mesh
+  for (const cube of sim.cubes.values()) {
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE),
+      new THREE.MeshStandardMaterial({ color: 0xc48a5a })
+    );
+    scene.add(mesh);
+    cubeMeshes.set(cube.id, mesh);
+  }
+
+  const clickMarker = new THREE.Mesh(
+    new THREE.RingGeometry(0.15, 0.25, 24),
+    new THREE.MeshBasicMaterial({ color: 0x8a8fbf, transparent: true, opacity: 0 })
+  );
+  clickMarker.rotation.x = -Math.PI / 2;
+  clickMarker.position.y = 0.03;
+  scene.add(clickMarker);
+  let clickMarkerFadeStart = 0;
+
+  // ---- clock sync ---------------------------------------------------------
+  // Server timestamps every command with its own wall clock (execAt). We
+  // estimate the offset between our clock and the server's once, using a
+  // classic NTP-style midpoint, so we can convert execAt into our own local
+  // timeline without the server having to track anything per-connection.
+  let clockOffset = 0;
+  function sendTimeSync() {
+    ws.send(JSON.stringify({ type: "time_sync", t0: Date.now() }));
+  }
+  sendTimeSync();
+
+  // ---- inbound command queue --------------------------------------------
+  // FIFO is intentional: the server broadcasts commands from a single
+  // ordered log, so arrival order already equals the authoritative order —
+  // no re-sorting needed as long as we always drain strictly from the front.
+  const pendingCommands = [];
 
   ws.addEventListener("message", (event) => {
     const msg = JSON.parse(event.data);
-    if (msg.type === "state_update") {
-      const now = performance.now();
-      for (const p of msg.players) {
-        if (p.id === myId) continue; // don't override local prediction
-        const entry = meshes.get(p.id);
-        if (!entry) continue;
-        entry.buffer.push({ t: now, x: p.x, y: p.y, z: p.z, rotY: p.rotY });
-        const cutoff = now - BUFFER_MAX_AGE_MS;
-        while (entry.buffer.length > 2 && entry.buffer[1].t < cutoff) {
-          entry.buffer.shift();
+    switch (msg.type) {
+      case "time_sync_reply": {
+        const t2 = Date.now();
+        clockOffset = msg.serverNow - (msg.t0 + t2) / 2;
+        break;
+      }
+      case "cmd": {
+        pendingCommands.push(msg);
+        break;
+      }
+      case "player_left": {
+        const mesh = playerMeshes.get(msg.id);
+        if (mesh) {
+          scene.remove(mesh);
+          playerMeshes.delete(msg.id);
         }
+        sim.players.delete(msg.id);
+        break;
       }
-    } else if (msg.type === "player_left") {
-      const entry = meshes.get(msg.id);
-      if (entry) {
-        scene.remove(entry.mesh);
-        meshes.delete(msg.id);
+      case "session_closed": {
+        alert("Session closed due to inactivity.");
+        location.href = "/index.html";
+        break;
       }
-    } else if (msg.type === "session_closed") {
-      alert("Session closed due to inactivity.");
-      location.href = "/index.html";
+      default:
+        break;
     }
   });
 
-  const keys = new Set();
-  window.addEventListener("keydown", (e) => keys.add(e.key.toLowerCase()));
-  window.addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
+  // ---- input: click to move/gather, spacebar to drop ---------------------
+  const raycaster = new THREE.Raycaster();
+  const pointerNDC = new THREE.Vector2();
 
-  // simple touch drag for mobile
-  let touchStart = null;
-  let touchVec = { x: 0, z: 0 };
-  window.addEventListener("touchstart", (e) => {
-    touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
-  });
-  window.addEventListener("touchmove", (e) => {
-    if (!touchStart) return;
-    const dx = e.touches[0].clientX - touchStart.x;
-    const dy = e.touches[0].clientY - touchStart.y;
-    touchVec = { x: dx / 50, z: dy / 50 };
-  });
-  window.addEventListener("touchend", () => {
-    touchStart = null;
-    touchVec = { x: 0, z: 0 };
-  });
+  canvas.addEventListener("pointerdown", (e) => {
+    const rect = canvas.getBoundingClientRect();
+    pointerNDC.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    pointerNDC.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(pointerNDC, camera);
 
-  const myEntry = meshes.get(myId);
-  let lastSend = 0;
-  let lastFrame = performance.now();
-
-  function tick(now) {
-    const dt = Math.min((now - lastFrame) / 1000, 0.1);
-    lastFrame = now;
-
-    if (myEntry) {
-      let dx = 0;
-      let dz = 0;
-      if (keys.has("w") || keys.has("arrowup")) dz -= 1;
-      if (keys.has("s") || keys.has("arrowdown")) dz += 1;
-      if (keys.has("a") || keys.has("arrowleft")) dx -= 1;
-      if (keys.has("d") || keys.has("arrowright")) dx += 1;
-      dx += touchVec.x;
-      dz += touchVec.z;
-
-      const len = Math.hypot(dx, dz);
-      if (len > 0) {
-        dx /= len;
-        dz /= len;
-        myEntry.target.x += dx * MOVE_SPEED * dt;
-        myEntry.target.z += dz * MOVE_SPEED * dt;
-        myEntry.target.rotY = Math.atan2(dx, dz);
-
-        // client-side prediction: render own player immediately
-        myEntry.mesh.position.x = myEntry.target.x;
-        myEntry.mesh.position.z = myEntry.target.z;
-        myEntry.mesh.rotation.y = myEntry.target.rotY;
+    const cubeHit = raycaster.intersectObjects([...cubeMeshes.values()])[0];
+    if (cubeHit) {
+      const cubeId = [...cubeMeshes.entries()].find(([, m]) => m === cubeHit.object)?.[0];
+      if (cubeId) {
+        ws.send(JSON.stringify({ type: "cmd", cmd: { kind: "gather", cubeId } }));
+        showClickMarker(cubeHit.point.x, cubeHit.point.z);
       }
-
-      if (now - lastSend > 1000 / INPUT_SEND_HZ) {
-        lastSend = now;
-        ws.send(
-          JSON.stringify({
-            type: "input",
-            x: myEntry.target.x,
-            y: myEntry.target.y,
-            z: myEntry.target.z,
-            rotY: myEntry.target.rotY,
-          })
-        );
-      }
+      return;
     }
 
-    const renderTime = now - INTERP_DELAY_MS;
-    for (const [id, entry] of meshes) {
-      if (id === myId) continue;
-      const snap = sampleBuffer(entry.buffer, renderTime);
-      entry.mesh.position.set(snap.x, snap.y, snap.z);
-      entry.mesh.rotation.y = snap.rotY;
+    const groundHit = raycaster.intersectObject(ground)[0];
+    if (groundHit) {
+      ws.send(
+        JSON.stringify({
+          type: "cmd",
+          cmd: { kind: "move", x: groundHit.point.x, z: groundHit.point.z },
+        })
+      );
+      showClickMarker(groundHit.point.x, groundHit.point.z);
+    }
+  });
+
+  window.addEventListener("keydown", (e) => {
+    if (e.code === "Space") {
+      e.preventDefault();
+      ws.send(JSON.stringify({ type: "cmd", cmd: { kind: "drop" } }));
+    }
+  });
+
+  function showClickMarker(x, z) {
+    clickMarker.position.x = x;
+    clickMarker.position.z = z;
+    clickMarker.material.opacity = 0.9;
+    clickMarkerFadeStart = performance.now();
+  }
+
+  // ---- fixed-step simulation loop with render-time interpolation --------
+  // "Fix your timestep": the sim only ever advances in TICK_MS increments so
+  // every client's floating-point math takes the identical path regardless
+  // of that client's render framerate. We render by interpolating between
+  // the last two fixed-step snapshots using the leftover accumulator time,
+  // purely for visual smoothness — it never feeds back into the sim.
+  let prevSnap = snapshot(sim);
+  let currSnap = snapshot(sim);
+  let accumulatorMs = 0;
+  let lastFrameTime = Date.now();
+  let simClock = Date.now();
+
+  function applyDueCommands() {
+    while (pendingCommands.length) {
+      const next = pendingCommands[0];
+      const localExecAt = next.execAt - clockOffset;
+      if (localExecAt > simClock) break;
+      pendingCommands.shift();
+      applyCommand(sim, next.playerId, next.cmd);
+    }
+  }
+
+  function tick() {
+    const now = Date.now();
+    const frameDelta = Math.min(now - lastFrameTime, MAX_FRAME_DELTA_MS);
+    lastFrameTime = now;
+    accumulatorMs = Math.min(accumulatorMs + frameDelta, MAX_ACCUMULATOR_MS);
+
+    while (accumulatorMs >= TICK_MS) {
+      simClock += TICK_MS;
+      applyDueCommands();
+      prevSnap = currSnap;
+      step(sim, TICK_MS / 1000);
+      currSnap = snapshot(sim);
+      accumulatorMs -= TICK_MS;
+    }
+
+    const alpha = accumulatorMs / TICK_MS;
+    render(alpha);
+
+    if (clickMarker.material.opacity > 0) {
+      const age = performance.now() - clickMarkerFadeStart;
+      clickMarker.material.opacity = Math.max(0, 0.9 - age / 400);
     }
 
     renderer.render(scene, camera);
     requestAnimationFrame(tick);
   }
+
+  function render(alpha) {
+    for (const [id, mesh] of playerMeshes) {
+      const a = prevSnap.players[id];
+      const b = currSnap.players[id];
+      if (!a || !b) continue;
+      const x = a.x + (b.x - a.x) * alpha;
+      const z = a.z + (b.z - a.z) * alpha;
+      const facing = lerpAngle(a.facing, b.facing, alpha);
+      mesh.position.set(x, PLAYER_REST_Y, z);
+      mesh.rotation.y = facing;
+
+      if (id === myId) {
+        myMarker.position.x = x;
+        myMarker.position.z = z;
+      }
+    }
+
+    for (const [id, mesh] of cubeMeshes) {
+      const c = currSnap.cubes[id];
+      if (!c) continue;
+      if (c.carriedBy) {
+        const carrierMesh = playerMeshes.get(c.carriedBy);
+        if (carrierMesh) {
+          mesh.position.set(carrierMesh.position.x, CARRY_HEIGHT, carrierMesh.position.z);
+        }
+      } else {
+        const worldX = (c.cx - GRID_SIZE / 2 + 0.5) * CELL_SIZE;
+        const worldZ = (c.cz - GRID_SIZE / 2 + 0.5) * CELL_SIZE;
+        mesh.position.set(worldX, CUBE_REST_Y, worldZ);
+      }
+    }
+  }
+
   requestAnimationFrame(tick);
 
   window.addEventListener("resize", () => {
