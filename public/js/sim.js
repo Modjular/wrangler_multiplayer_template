@@ -20,6 +20,11 @@ export const MAX_STACK_HEIGHT = 4; // cap how tall a column of cubes can get
 export const BASE_SPEED = 3.2; // units/sec
 export const ARRIVE_EPSILON = 0.05;
 
+// Purely cosmetic mesh variants for "block" cubes -- see game.js. Doesn't
+// affect gameplay at all (walkability, stacking, carrying are all keyed off
+// `type`, never `shape`), it's just which geometry a block renders as.
+export const BLOCK_SHAPES = ["cube", "octagon", "cylinder"];
+
 const SQRT2 = Math.SQRT2;
 
 // 8 octants in the same winding as DIR_INDEX below, index i is the grid
@@ -153,8 +158,9 @@ function generateCubes(seed, excludeCells) {
     if ([...cubes.values()].some((c) => c.cx === cx && c.cz === cz)) continue;
     const weight = 1 + Math.floor(rng() * 3); // 1..3
     const type = rng() < RAMP_CHANCE ? "ramp" : "block";
+    const shape = type === "block" ? BLOCK_SHAPES[Math.floor(rng() * BLOCK_SHAPES.length)] : null;
     const cubeId = `cube_${id++}`;
-    cubes.set(cubeId, { id: cubeId, cx, cz, level: 0, weight, type, carriedBy: null });
+    cubes.set(cubeId, { id: cubeId, cx, cz, level: 0, weight, type, shape, carriedBy: null });
   }
   return cubes;
 }
@@ -189,7 +195,12 @@ export function createSimulation({ seed, players }) {
 // the cell itself is off-limits. Unlike before ramps existed, there's no
 // "nearest walkable cell" fallback: a click on a spot you can't climb to
 // just fails, the same way a boxed-in gather/delivery already does.
-function findPath(sim, fromX, fromZ, toX, toZ) {
+//
+// Exported (read-only, no side effects) so game.js can compute the same
+// path locally for instant-feedback client-side prediction of the local
+// player's own "move" commands, without waiting for the lockstep round
+// trip. See game.js's motion-prediction comment for the full picture.
+export function findPath(sim, fromX, fromZ, toX, toZ) {
   const start = worldToCell(fromX, fromZ);
   const goal = worldToCell(toX, toZ);
 
@@ -378,7 +389,12 @@ export function applyCommand(sim, playerId, cmd) {
   }
 }
 
-function advanceAlongPath(player, speed, dt) {
+// Exported so game.js can drive the exact same movement math for local
+// prediction (see findPath's export comment above) -- mutates `player.x`,
+// `.z`, `.facing`, and `.order.pathIndex` in place, same as it does for the
+// real sim; the caller can pass in a throwaway object shaped like a player
+// for a purely-local, never-networked prediction.
+export function advanceAlongPath(player, speed, dt) {
   let remaining = speed * dt;
   while (remaining > 0 && player.order.pathIndex < player.order.path.length) {
     const wp = player.order.path[player.order.pathIndex];
@@ -496,7 +512,7 @@ export function snapshot(sim) {
   }
   const cubes = {};
   for (const [id, c] of sim.cubes) {
-    cubes[id] = { cx: c.cx, cz: c.cz, level: c.level, type: c.type, weight: c.weight, carriedBy: c.carriedBy };
+    cubes[id] = { cx: c.cx, cz: c.cz, level: c.level, type: c.type, shape: c.shape, weight: c.weight, carriedBy: c.carriedBy };
   }
   return { players, cubes };
 }

@@ -8,6 +8,9 @@ import {
   snapshot,
   worldToCell,
   cellCenter,
+  findPath,
+  advanceAlongPath,
+  BASE_SPEED,
 } from "./sim.js";
 
 const COLORS = [0xff6b6b, 0x4ecdc4, 0xffe66d, 0x95e1d3, 0xa78bfa];
@@ -27,6 +30,59 @@ const CARRY_HEIGHT_OFFSET = PLAYER_LENGTH / 2 + CUBE_SIZE / 2 + 0.1;
 
 function realHeightOf(cubeType) {
   return cubeType === "ramp" ? RAMP_HEIGHT : CUBE_SIZE;
+}
+
+// `shape` is purely cosmetic (see sim.js's BLOCK_SHAPES) -- every shape
+// still fills roughly the same footprint/height so stacking and carrying
+// look consistent regardless of which one a given block happens to be.
+// Ramps ignore shape entirely and are always a plain slab.
+function cubeGeometry(cubeType, shape, height) {
+  if (cubeType === "block") {
+    const radius = CUBE_SIZE / 2;
+    if (shape === "octagon") return new THREE.CylinderGeometry(radius, radius, height, 8);
+    if (shape === "cylinder") return new THREE.CylinderGeometry(radius, radius, height, 24);
+  }
+  return new THREE.BoxGeometry(CUBE_SIZE, height, CUBE_SIZE);
+}
+
+// ---- movement "juice": spring-smoothed follow + lean into accel/decel ----
+// The sim itself moves at constant speed with no easing (it has to stay
+// simple and deterministic for lockstep -- see CLAUDE.md). This is a purely
+// visual layer on top: instead of snapping the mesh straight to the
+// authoritative (tick-interpolated) position, let it chase that position
+// with a critically-damped spring. Because the target starts and stops
+// abruptly (an order kicks in, then goes idle), a spring trailing behind it
+// naturally accelerates smoothly out of a stop and decelerates smoothly
+// into one -- no path-progress bookkeeping needed. The spring's own
+// acceleration doubles as a lean angle: forward while catching up to speed,
+// backward while braking into a stop.
+const SPRING_SMOOTH_TIME = 0.12; // seconds; lower = snappier catch-up to target
+const MAX_LEAN = 0.3; // radians
+const LEAN_ACCEL_SCALE = 0.045;
+const LEAN_SMOOTH_TIME = 0.1; // seconds; smooths the lean angle itself so it doesn't jitter
+
+// Standard critically-damped spring ("smooth damp"), ported from the
+// well-known Unity/Game Programming Gems formulation. `velocity` is a
+// mutable { value } ref so the caller can keep it around across frames.
+function smoothDamp(current, target, velocity, smoothTime, dt) {
+  const omega = 2 / smoothTime;
+  const x = omega * dt;
+  const exp = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x);
+  const change = current - target;
+  const temp = (velocity.value + omega * change) * dt;
+  velocity.value = (velocity.value - omega * temp) * exp;
+  let output = target + (change + temp) * exp;
+  // Clamp so the spring can't overshoot and oscillate past a now-stationary
+  // target: trip only if we've actually crossed past it in the direction we
+  // were heading (target - current), not just landed on the same side we
+  // started from -- using `change` (current - target) here would fire on
+  // basically every frame and force a hard snap-to-target every time,
+  // killing all lag (and with it, the whole point of the spring).
+  if (target - current > 0 === output > target) {
+    output = target;
+    velocity.value = (output - target) / dt;
+  }
+  return output;
 }
 
 function shortestAngleDelta(from, to) {
@@ -63,13 +119,32 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     0.1,
     1000
   );
-  camera.position.set(0, mapExtent * 1.1, mapExtent * 0.95);
-  camera.lookAt(0, 0, 0);
+  // The camera rig keeps this fixed offset from cameraLookTarget forever --
+  // panning moves the target (and camera) together, never rotates. Because
+  // it's a pure translation, the ground-plane point under any given screen
+  // position also translates by exactly the same amount the rig does,
+  // which is what makes intersectGroundPlaneY0-based dragging exact (see
+  // panTo).
+  const CAMERA_OFFSET = { x: 0, y: mapExtent * 1.1, z: mapExtent * 0.95 };
+  const cameraLookTarget = { x: 0, z: 0 };
+  const PAN_LIMIT = mapExtent * 0.85;
+  function updateCameraTransform() {
+    camera.position.set(
+      cameraLookTarget.x + CAMERA_OFFSET.x,
+      CAMERA_OFFSET.y,
+      cameraLookTarget.z + CAMERA_OFFSET.z
+    );
+    camera.lookAt(cameraLookTarget.x, 0, cameraLookTarget.z);
+  }
+  updateCameraTransform();
   window.__camera = camera; // debug/test hook: reproject world -> screen coords
 
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(window.devicePixelRatio);
+  // We handle all touch gestures ourselves (drag-to-place, drag-to-pan) --
+  // tell the browser not to also try to scroll/zoom/select on the canvas.
+  canvas.style.touchAction = "none";
 
   scene.add(new THREE.AmbientLight(0xffffff, 0.6));
   const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
@@ -102,6 +177,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     scene.add(mesh);
     playerMeshes.set(p.id, mesh);
   }
+  window.__playerMeshes = playerMeshes; // debug/test hook: inspect rendered player transforms
 
   const myMarker = new THREE.Mesh(
     new THREE.RingGeometry(PLAYER_RADIUS + 0.15, PLAYER_RADIUS + 0.25, 24),
@@ -122,7 +198,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   for (const cube of sim.cubes.values()) {
     const height = realHeightOf(cube.type);
     const mesh = new THREE.Mesh(
-      new THREE.BoxGeometry(CUBE_SIZE, height, CUBE_SIZE),
+      cubeGeometry(cube.type, cube.shape, height),
       new THREE.MeshStandardMaterial({ color: CUBE_COLOR })
     );
     scene.add(mesh);
@@ -249,7 +325,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       if (!visuals) {
         const color = COLORS[colorIndexById.get(id) % COLORS.length];
         const ghost = new THREE.Mesh(
-          new THREE.BoxGeometry(CUBE_SIZE, ownHeight, CUBE_SIZE),
+          cubeGeometry(cubeSnap.type, cubeSnap.shape, ownHeight),
           new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.35 })
         );
         const line = new THREE.Line(
@@ -323,6 +399,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
           playerMeshes.delete(msg.id);
         }
         sim.players.delete(msg.id);
+        motionState.delete(msg.id);
         break;
       }
       case "session_closed": {
@@ -345,22 +422,120 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     pointerNDC.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
   }
 
+  // ---- mobile: drag a block to place it, or drag empty space to pan ------
+  // On touch there's no hover state to arm a two-tap plan with (a finger
+  // only "moves" while it's down), so touch gets its own gesture: press on
+  // a block to pick it up immediately and release to place it (reusing the
+  // exact same selectedCubeId/dragGhost the desktop two-click flow uses --
+  // see pointerdown/pointerup), or press on empty ground and either tap
+  // (release without much movement -- walk there, like a desktop click) or
+  // drag (pan the camera). Desktop's mouse/pen flow below is untouched.
+  const PAN_DRAG_THRESHOLD_PX = 10;
+  let touchGesture = null; // { type: "block" } | { type: "pending", panAnchor } | { type: "pan", panAnchor }
+  // Only one finger drives a gesture at a time -- an incidental second touch
+  // (e.g. a resting thumb) while dragging must not hijack touchGesture out
+  // from under the finger that's actually mid-drag.
+  let activeTouchPointerId = null;
+
+  // Ray-vs-infinite-Y=0-plane intersection (not limited to the finite
+  // `ground` mesh) -- panning needs a world point even when the finger is
+  // over background beyond the playable grid.
+  function intersectGroundPlaneY0(clientX, clientY) {
+    pointerToNDC({ clientX, clientY });
+    raycaster.setFromCamera(pointerNDC, camera);
+    const origin = raycaster.ray.origin;
+    const dir = raycaster.ray.direction;
+    if (Math.abs(dir.y) < 1e-6) return null;
+    const t = -origin.y / dir.y;
+    if (t < 0) return null;
+    return { x: origin.x + dir.x * t, z: origin.z + dir.z * t };
+  }
+
+  // Shifts the camera rig so the world point `anchor` ends up back under
+  // (clientX, clientY) -- i.e. "drag the world" panning. Since the rig only
+  // ever translates (see CAMERA_OFFSET above), this can be solved exactly
+  // in one step every frame instead of accumulating per-frame deltas.
+  function panTo(anchor, clientX, clientY) {
+    const under = intersectGroundPlaneY0(clientX, clientY);
+    if (!under) return;
+    cameraLookTarget.x = Math.max(-PAN_LIMIT, Math.min(PAN_LIMIT, cameraLookTarget.x + (anchor.x - under.x)));
+    cameraLookTarget.z = Math.max(-PAN_LIMIT, Math.min(PAN_LIMIT, cameraLookTarget.z + (anchor.z - under.z)));
+    updateCameraTransform();
+  }
+
+  function beginCubeSelection(cubeId) {
+    const selectedCube = sim.cubes.get(cubeId);
+    selectedCubeId = cubeId;
+    selectedCubeHeight = realHeightOf(selectedCube?.type);
+    dragGhost.geometry.dispose();
+    dragGhost.geometry = cubeGeometry(selectedCube?.type, selectedCube?.shape, selectedCubeHeight);
+    setHoveredCube(null);
+  }
+
+  function commitSelectedCubePlacement(groundHit) {
+    if (groundHit) {
+      ws.send(
+        JSON.stringify({
+          type: "cmd",
+          cmd: { kind: "move_block", cubeId: selectedCubeId, x: groundHit.point.x, z: groundHit.point.z },
+        })
+      );
+      showClickMarker(groundHit.point.x, groundHit.point.z);
+      myPrediction = null; // a deliver plan isn't predicted; don't leave a stale move running
+    }
+    cancelSelection();
+  }
+
+  // Snaps the drag ghost to whatever grid cell (clientX, clientY) is over,
+  // stacked on top of that column's current contents. Shared by the desktop
+  // hover-preview and the touch drag-preview so the two input modes can't
+  // silently disagree on where a cube will land.
+  function updateDragGhostAt(clientX, clientY) {
+    pointerToNDC({ clientX, clientY });
+    raycaster.setFromCamera(pointerNDC, camera);
+    const groundHit = raycaster.intersectObject(ground)[0];
+    if (groundHit) {
+      const { cx, cz } = worldToCell(groundHit.point.x, groundHit.point.z);
+      const c = cellCenter(cx, cz);
+      const topY = columnTopY(c.x, c.z);
+      dragGhost.position.set(c.x, topY + selectedCubeHeight / 2, c.z);
+      dragGhost.visible = true;
+    }
+  }
+
+  function handleTouchMove(e) {
+    if (e.pointerId !== activeTouchPointerId) return;
+    if (!touchGesture) return;
+
+    if (touchGesture.type === "block") {
+      updateDragGhostAt(e.clientX, e.clientY);
+      return;
+    }
+
+    if (touchGesture.type === "pending") {
+      const dx = e.clientX - touchGesture.startClientX;
+      const dy = e.clientY - touchGesture.startClientY;
+      if (Math.hypot(dx, dy) < PAN_DRAG_THRESHOLD_PX) return;
+      touchGesture = { type: "pan", panAnchor: touchGesture.panAnchor };
+    }
+
+    if (touchGesture.type === "pan" && touchGesture.panAnchor) {
+      panTo(touchGesture.panAnchor, e.clientX, e.clientY);
+    }
+  }
+
   canvas.addEventListener("pointermove", (e) => {
+    if (e.pointerType === "touch") {
+      handleTouchMove(e);
+      return;
+    }
+
     pointerToNDC(e);
     raycaster.setFromCamera(pointerNDC, camera);
 
     if (selectedCubeId !== null) {
       setHoveredCube(null);
-      const groundHit = raycaster.intersectObject(ground)[0];
-      if (groundHit) {
-        const { cx, cz } = worldToCell(groundHit.point.x, groundHit.point.z);
-        const c = cellCenter(cx, cz);
-        // Preview where it'll actually land: on top of whatever's already
-        // stacked in that column, not always at ground level.
-        const topY = columnTopY(c.x, c.z);
-        dragGhost.position.set(c.x, topY + selectedCubeHeight / 2, c.z);
-        dragGhost.visible = true;
-      }
+      updateDragGhostAt(e.clientX, e.clientY);
       return;
     }
 
@@ -377,21 +552,49 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     pointerToNDC(e);
     raycaster.setFromCamera(pointerNDC, camera);
 
+    if (e.pointerType === "touch") {
+      // A gesture is already in progress under a different finger (e.g. a
+      // resting thumb) -- ignore this touch entirely rather than letting it
+      // hijack touchGesture out from under the finger actually driving it.
+      if (activeTouchPointerId !== null && e.pointerId !== activeTouchPointerId) return;
+
+      if (selectedCubeId !== null) {
+        // Rare: an earlier tap already armed a plan (e.g. tap-select then a
+        // separate tap-place instead of one continuous drag) -- commit it
+        // the same way a drag-release does.
+        commitSelectedCubePlacement(raycaster.intersectObject(ground)[0]);
+        touchGesture = null;
+        return;
+      }
+
+      const cubeHit = raycaster.intersectObjects([...cubeMeshes.values()])[0];
+      if (cubeHit) {
+        const cubeId = [...cubeMeshes.entries()].find(([, m]) => m === cubeHit.object)?.[0];
+        if (cubeId && isGatherable(cubeId)) {
+          beginCubeSelection(cubeId);
+          touchGesture = { type: "block" };
+          activeTouchPointerId = e.pointerId;
+          return;
+        }
+      }
+
+      // Not on a cube -- could still turn into either a tap-to-move or a
+      // pan drag; decide once we see how far it moves (see handleTouchMove).
+      touchGesture = {
+        type: "pending",
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        panAnchor: intersectGroundPlaneY0(e.clientX, e.clientY),
+      };
+      activeTouchPointerId = e.pointerId;
+      return;
+    }
+
     // Second click of a delivery plan: commit the destination and send the
     // plan as a single command. What happens next (can the avatar actually
     // get there and back) is entirely up to the sim — see sim.js.
     if (selectedCubeId !== null) {
-      const groundHit = raycaster.intersectObject(ground)[0];
-      if (groundHit) {
-        ws.send(
-          JSON.stringify({
-            type: "cmd",
-            cmd: { kind: "move_block", cubeId: selectedCubeId, x: groundHit.point.x, z: groundHit.point.z },
-          })
-        );
-        showClickMarker(groundHit.point.x, groundHit.point.z);
-      }
-      cancelSelection();
+      commitSelectedCubePlacement(raycaster.intersectObject(ground)[0]);
       return;
     }
 
@@ -401,25 +604,45 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     if (cubeHit) {
       const cubeId = [...cubeMeshes.entries()].find(([, m]) => m === cubeHit.object)?.[0];
       if (cubeId && isGatherable(cubeId)) {
-        selectedCubeId = cubeId;
-        selectedCubeHeight = realHeightOf(sim.cubes.get(cubeId)?.type);
-        dragGhost.geometry.dispose();
-        dragGhost.geometry = new THREE.BoxGeometry(CUBE_SIZE, selectedCubeHeight, CUBE_SIZE);
-        setHoveredCube(null);
+        beginCubeSelection(cubeId);
         return;
       }
     }
 
     const groundHit = raycaster.intersectObject(ground)[0];
     if (groundHit) {
-      ws.send(
-        JSON.stringify({
-          type: "cmd",
-          cmd: { kind: "move", x: groundHit.point.x, z: groundHit.point.z },
-        })
-      );
-      showClickMarker(groundHit.point.x, groundHit.point.z);
+      sendMyMove(groundHit.point.x, groundHit.point.z);
     }
+  });
+
+  canvas.addEventListener("pointerup", (e) => {
+    if (e.pointerType !== "touch" || !touchGesture || e.pointerId !== activeTouchPointerId) return;
+
+    if (touchGesture.type === "block") {
+      pointerToNDC(e);
+      raycaster.setFromCamera(pointerNDC, camera);
+      commitSelectedCubePlacement(raycaster.intersectObject(ground)[0]);
+    } else if (touchGesture.type === "pending") {
+      // Released without dragging past the threshold: a tap, same as a
+      // desktop click on empty ground.
+      pointerToNDC(e);
+      raycaster.setFromCamera(pointerNDC, camera);
+      const groundHit = raycaster.intersectObject(ground)[0];
+      if (groundHit) {
+        sendMyMove(groundHit.point.x, groundHit.point.z);
+      }
+    }
+    // type "pan": nothing to commit, just stop panning.
+
+    touchGesture = null;
+    activeTouchPointerId = null;
+  });
+
+  canvas.addEventListener("pointercancel", (e) => {
+    if (e.pointerId !== activeTouchPointerId) return;
+    if (selectedCubeId !== null) cancelSelection();
+    touchGesture = null;
+    activeTouchPointerId = null;
   });
 
   canvas.addEventListener("contextmenu", (e) => {
@@ -431,16 +654,109 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     if (e.code === "Space") {
       e.preventDefault();
       ws.send(JSON.stringify({ type: "cmd", cmd: { kind: "drop" } }));
+      myPrediction = null; // dropping isn't predicted; don't leave a stale move running
     } else if (e.code === "Escape" && selectedCubeId !== null) {
       cancelSelection();
     }
   });
+
+  // Sends a "move" command and kicks off local prediction for it -- shared
+  // by the desktop ground-click and the touch tap-to-move handler so the
+  // two input modes can't silently diverge.
+  function sendMyMove(x, z) {
+    ws.send(JSON.stringify({ type: "cmd", cmd: { kind: "move", x, z } }));
+    showClickMarker(x, z);
+    startMyPrediction(x, z);
+  }
 
   function showClickMarker(x, z) {
     clickMarker.position.x = x;
     clickMarker.position.z = z;
     clickMarker.material.opacity = 0.9;
     clickMarkerFadeStart = performance.now();
+  }
+
+  // ---- instant local feedback: predict my own "move" commands -------------
+  // The lockstep buffer (INPUT_DELAY_MS, in GameRoom.js) means even the
+  // player who issued a command doesn't see it take effect in the
+  // authoritative sim for ~200ms -- that's what keeps every client in sync,
+  // and this doesn't touch it. But there's no reason *my own* avatar can't
+  // start visually walking the instant I click: run the exact same
+  // findPath/advanceAlongPath the real sim will eventually use, right now,
+  // purely for rendering. It never touches `sim` and is never sent
+  // anywhere, so however wrong it turns out to be, it cannot desync anyone
+  // -- worst case, my own avatar's visual position corrects itself once the
+  // authoritative order settles (rare: only when something else, like
+  // another player moving a cube, made my predicted path stale in the
+  // 200ms window). A rare correction beats guaranteed lag on every click.
+  // Scoped to "move" only -- gather/deliver/drop interact with contested
+  // cube state in ways that are much riskier to predict well.
+  let myPrediction = null; // { x, z, facing, prevX, prevZ, prevFacing, order: {path, pathIndex}, targetMoveSeq }
+  // Counts my own "move" commands: `sentMoveCount` increments on every one I
+  // send, `appliedMoveCount` increments in applyDueCommands() when the
+  // authoritative sim actually applies one of mine. myPrediction stamps the
+  // sent-count value that corresponds to *its own* command (targetMoveSeq),
+  // so advanceMyPrediction can tell "the order is idle because my command
+  // hasn't been applied yet" apart from "the order is idle because it was
+  // just applied and immediately rejected" apart from "idle because an
+  // *older* command of mine finished" -- using the order's idle/non-idle
+  // state alone can't distinguish any of these, and confusing them either
+  // clears a still-in-flight prediction early (visible rubber-banding when
+  // clicking a new destination before the previous one's authoritative move
+  // has finished) or leaves a rejected one stuck forever (a locally
+  // "successful" prediction whose authoritative order never left "idle" at
+  // all, so it never looked non-idle in the first place).
+  let sentMoveCount = 0;
+  let appliedMoveCount = 0;
+
+  function startMyPrediction(targetX, targetZ) {
+    const myPlayer = sim.players.get(myId);
+    const targetMoveSeq = ++sentMoveCount;
+    if (!myPlayer) return;
+    const fromX = myPrediction ? myPrediction.x : myPlayer.x;
+    const fromZ = myPrediction ? myPrediction.z : myPlayer.z;
+    const fromFacing = myPrediction ? myPrediction.facing : myPlayer.facing;
+    const path = findPath(sim, fromX, fromZ, targetX, targetZ);
+    if (!path.length) {
+      myPrediction = null;
+      return;
+    }
+    myPrediction = {
+      x: fromX,
+      z: fromZ,
+      facing: fromFacing,
+      prevX: fromX,
+      prevZ: fromZ,
+      prevFacing: fromFacing,
+      order: { path, pathIndex: 0 },
+      targetMoveSeq,
+    };
+  }
+
+  function advanceMyPrediction() {
+    if (!myPrediction) return;
+    myPrediction.prevX = myPrediction.x;
+    myPrediction.prevZ = myPrediction.z;
+    myPrediction.prevFacing = myPrediction.facing;
+
+    if (myPrediction.order.pathIndex < myPrediction.order.path.length) {
+      const myPlayer = sim.players.get(myId);
+      const carriedCube = myPlayer?.carrying ? sim.cubes.get(myPlayer.carrying) : null;
+      const speed = carriedCube ? BASE_SPEED / (1 + 0.35 * carriedCube.weight) : BASE_SPEED;
+      advanceAlongPath(myPrediction, speed, TICK_MS / 1000);
+    }
+
+    // Only clear once the authoritative sim has actually applied *this*
+    // prediction's own command (not a stale earlier or not-yet-arrived later
+    // one) and its resulting order has resolved back to idle -- immediately,
+    // if the authoritative path turned out to be unreachable, or once the
+    // walk finishes, otherwise.
+    if (appliedMoveCount >= myPrediction.targetMoveSeq) {
+      const authOrder = sim.players.get(myId)?.order;
+      if (authOrder && authOrder.type === "idle") {
+        myPrediction = null;
+      }
+    }
   }
 
   // ---- fixed-step simulation loop with render-time interpolation --------
@@ -455,6 +771,18 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   let lastFrameTime = Date.now();
   let simClock = Date.now();
 
+  // playerId -> spring-follow state for the movement "juice" (see smoothDamp above).
+  const motionState = new Map();
+  window.__motionState = motionState; // debug/test hook: inspect the spring-follow state
+  function getMotionState(id, initialX, initialZ) {
+    let m = motionState.get(id);
+    if (!m) {
+      m = { x: initialX, z: initialZ, velX: { value: 0 }, velZ: { value: 0 }, prevSpeed: 0, lean: 0 };
+      motionState.set(id, m);
+    }
+    return m;
+  }
+
   function applyDueCommands() {
     while (pendingCommands.length) {
       const next = pendingCommands[0];
@@ -462,6 +790,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       if (localExecAt > simClock) break;
       pendingCommands.shift();
       applyCommand(sim, next.playerId, next.cmd);
+      if (next.playerId === myId && next.cmd.kind === "move") appliedMoveCount++;
     }
   }
 
@@ -492,6 +821,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       prevSnap = currSnap;
       step(sim, TICK_MS / 1000);
       currSnap = snapshot(sim);
+      advanceMyPrediction();
       accumulatorMs -= TICK_MS;
     }
 
@@ -501,7 +831,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     // wildly past it; the rest of the backlog plays out over the next
     // frame(s).
     const alpha = Math.min(accumulatorMs / TICK_MS, 1);
-    render(alpha);
+    render(alpha, Math.max(frameDelta, 1) / 1000);
 
     if (clickMarker.material.opacity > 0) {
       const age = performance.now() - clickMarkerFadeStart;
@@ -512,20 +842,46 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     requestAnimationFrame(tick);
   }
 
-  function render(alpha) {
+  function render(alpha, dt) {
     for (const [id, mesh] of playerMeshes) {
-      const a = prevSnap.players[id];
-      const b = currSnap.players[id];
-      if (!a || !b) continue;
-      const x = a.x + (b.x - a.x) * alpha;
-      const z = a.z + (b.z - a.z) * alpha;
-      const facing = lerpAngle(a.facing, b.facing, alpha);
-      mesh.position.set(x, PLAYER_REST_Y + columnTopY(x, z), z);
+      let targetX, targetZ, facing;
+      if (id === myId && myPrediction) {
+        // Instant local feedback takes over my own avatar's target position
+        // entirely while a prediction is in flight -- see the comment by
+        // myPrediction's declaration.
+        targetX = myPrediction.prevX + (myPrediction.x - myPrediction.prevX) * alpha;
+        targetZ = myPrediction.prevZ + (myPrediction.z - myPrediction.prevZ) * alpha;
+        facing = lerpAngle(myPrediction.prevFacing, myPrediction.facing, alpha);
+      } else {
+        const a = prevSnap.players[id];
+        const b = currSnap.players[id];
+        if (!a || !b) continue;
+        targetX = a.x + (b.x - a.x) * alpha;
+        targetZ = a.z + (b.z - a.z) * alpha;
+        facing = lerpAngle(a.facing, b.facing, alpha);
+      }
+
+      // Spring-follow the authoritative target instead of snapping to it --
+      // see the smoothDamp comment up top for why this alone produces
+      // smooth accel/decel. Lean is derived from the spring's own
+      // acceleration (speeding up = lean in, braking = lean back).
+      const m = getMotionState(id, targetX, targetZ);
+      m.x = smoothDamp(m.x, targetX, m.velX, SPRING_SMOOTH_TIME, dt);
+      m.z = smoothDamp(m.z, targetZ, m.velZ, SPRING_SMOOTH_TIME, dt);
+
+      const speed = Math.hypot(m.velX.value, m.velZ.value);
+      const accel = (speed - m.prevSpeed) / dt;
+      m.prevSpeed = speed;
+      const targetLean = Math.max(-MAX_LEAN, Math.min(MAX_LEAN, accel * LEAN_ACCEL_SCALE));
+      m.lean += (targetLean - m.lean) * Math.min(1, dt / LEAN_SMOOTH_TIME);
+
+      mesh.position.set(m.x, PLAYER_REST_Y + columnTopY(m.x, m.z), m.z);
       mesh.rotation.y = facing;
+      mesh.rotation.x = m.lean;
 
       if (id === myId) {
-        myMarker.position.x = x;
-        myMarker.position.z = z;
+        myMarker.position.x = m.x;
+        myMarker.position.z = m.z;
       }
     }
 
