@@ -140,21 +140,29 @@ function isFlatStep(sim, fromCx, fromCz, toCx, toCz) {
   return canStep(sim, fromCx, fromCz, toCx, toCz) && columnHeight(sim, fromCx, fromCz) === columnHeight(sim, toCx, toCz);
 }
 
-// Every column reachable from (fromX, fromZ) by a sequence of legal steps
-// (see canStep) -- a flood fill, not a path to one specific goal. Orthogonal
-// neighbors only: a legal diagonal step requires both straddling orthogonal
-// cells to already be a legal flat step (see findPath), so it can never
-// reach a column that isn't already in this set via one of them -- skipping
-// diagonals here doesn't miss anything, it just avoids doing the extra work.
-// Exported (read-only, no side effects) purely so game.js can build a "can I
-// actually carry this out from here" UI hint (tinting the delivery-ghost
-// preview) without re-deriving the stepping rules -- see game.js's
-// beginCubeSelection/updateDragGhostAt and hasReachableApproach below.
-export function reachableColumns(sim, fromX, fromZ) {
-  const start = worldToCell(fromX, fromZ);
+// Every column adjacent to (targetCx, targetCz) whose height is exactly
+// `requiredHeight` -- i.e. every cell a player could actually be standing on
+// to reach/deliver something at that column (see findApproachAtHeight's
+// "forklift" rule: you have to be level with it). Exported so game.js can
+// seed a reachability flood fill from the real approach cells instead of
+// from the target's own column, which is usually one level too tall to
+// reflect where a player actually stands -- see reachableColumnsFromApproach
+// and hasReachableApproach below.
+export function approachCells(sim, targetCx, targetCz, requiredHeight) {
+  const cells = [];
+  for (const [dx, dz] of NEIGHBORS_4) {
+    const cx = targetCx + dx;
+    const cz = targetCz + dz;
+    if (!inBounds(cx, cz)) continue;
+    if (columnHeight(sim, cx, cz) === requiredHeight) cells.push({ cx, cz });
+  }
+  return cells;
+}
+
+function floodFillColumns(sim, startCells) {
   const key = (cx, cz) => `${cx},${cz}`;
-  const visited = new Set([key(start.cx, start.cz)]);
-  const queue = [[start.cx, start.cz]];
+  const visited = new Set(startCells.map(({ cx, cz }) => key(cx, cz)));
+  const queue = startCells.map(({ cx, cz }) => [cx, cz]);
   while (queue.length) {
     const [cx, cz] = queue.shift();
     for (const [dx, dz] of NEIGHBORS_4) {
@@ -171,6 +179,31 @@ export function reachableColumns(sim, fromX, fromZ) {
   return visited;
 }
 
+// Every column reachable from (fromX, fromZ) by a sequence of legal steps
+// (see canStep) -- a flood fill, not a path to one specific goal. Orthogonal
+// neighbors only: a legal diagonal step requires both straddling orthogonal
+// cells to already be a legal flat step (see findPath), so it can never
+// reach a column that isn't already in this set via one of them -- skipping
+// diagonals here doesn't miss anything, it just avoids doing the extra work.
+// Exported (read-only, no side effects) purely so game.js can build a "can I
+// actually carry this out from here" UI hint (tinting the delivery-ghost
+// preview) without re-deriving the stepping rules -- see game.js's
+// beginCubeSelection/updateDragGhostAt and hasReachableApproach below.
+export function reachableColumns(sim, fromX, fromZ) {
+  const start = worldToCell(fromX, fromZ);
+  return floodFillColumns(sim, [start]);
+}
+
+// Same flood fill, but seeded from every valid approach cell around
+// (targetCx, targetCz) at `requiredHeight` (see approachCells) instead of a
+// single point -- for "everywhere reachable once I'm standing next to
+// <cube>", where the cube's own column is *not* a valid stand-on point (it's
+// usually one level taller than the approach height) and there can be more
+// than one legal side to approach from.
+export function reachableColumnsFromApproach(sim, targetCx, targetCz, requiredHeight) {
+  return floodFillColumns(sim, approachCells(sim, targetCx, targetCz, requiredHeight));
+}
+
 // Given a set of columns reachable from wherever the player will actually be
 // standing (see reachableColumns), is there a column adjacent to
 // (targetCx, targetCz) at exactly `requiredHeight` in that set? Mirrors the
@@ -179,14 +212,7 @@ export function reachableColumns(sim, fromX, fromZ) {
 // CLAUDE.md-adjacent comments on findApproachAtHeight), just checked against
 // a precomputed reachable set instead of running its own pathfind.
 export function hasReachableApproach(sim, reachableSet, targetCx, targetCz, requiredHeight) {
-  for (const [dx, dz] of NEIGHBORS_4) {
-    const cx = targetCx + dx;
-    const cz = targetCz + dz;
-    if (!inBounds(cx, cz)) continue;
-    if (columnHeight(sim, cx, cz) !== requiredHeight) continue;
-    if (reachableSet.has(`${cx},${cz}`)) return true;
-  }
-  return false;
+  return approachCells(sim, targetCx, targetCz, requiredHeight).some(({ cx, cz }) => reachableSet.has(`${cx},${cz}`));
 }
 
 // Generates the scattered cube layout from the match seed. Every client calls
