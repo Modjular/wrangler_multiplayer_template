@@ -6,6 +6,8 @@ import {
   applyCommand,
   step,
   snapshot,
+  worldToCell,
+  cellCenter,
 } from "./sim.js";
 
 const COLORS = [0xff6b6b, 0x4ecdc4, 0xffe66d, 0x95e1d3, 0xa78bfa];
@@ -123,6 +125,110 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   scene.add(clickMarker);
   let clickMarkerFadeStart = 0;
 
+  // ---- block delivery plans: hover / drag-to-place UI ------------------
+  // Clicking a grounded cube no longer sends a raw "gather" — it starts a
+  // two-click "plan a delivery" flow: this preview ghost follows the cursor
+  // (snapped to the grid) until the player clicks a destination, at which
+  // point a single `move_block` command is sent and the avatar figures out
+  // on its own whether it can actually walk the cube there (see sim.js).
+  let hoveredCubeId = null;
+  let selectedCubeId = null;
+  const myColorIndex = colorIndexById.get(myId) ?? 0;
+
+  const dragGhost = new THREE.Mesh(
+    new THREE.BoxGeometry(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE),
+    new THREE.MeshBasicMaterial({
+      color: COLORS[myColorIndex % COLORS.length],
+      transparent: true,
+      opacity: 0.45,
+    })
+  );
+  dragGhost.visible = false;
+  scene.add(dragGhost);
+
+  // One ghost + dashed line per player currently carrying out a "deliver"
+  // plan (their own or anyone else's — this is read straight off the
+  // deterministic sim, so it's already in sync across every client without
+  // any extra network messages). Keyed by playerId, tinted with that
+  // player's color.
+  const planVisuals = new Map();
+
+  function setHoveredCube(cubeId) {
+    if (cubeId === hoveredCubeId) return;
+    if (hoveredCubeId !== null) {
+      const prevMesh = cubeMeshes.get(hoveredCubeId);
+      if (prevMesh) prevMesh.material.emissive.setHex(0x000000);
+    }
+    hoveredCubeId = cubeId;
+    if (hoveredCubeId !== null) {
+      const mesh = cubeMeshes.get(hoveredCubeId);
+      if (mesh) mesh.material.emissive.setHex(0x555555);
+    }
+  }
+
+  function updatePlanVisuals() {
+    const activeIds = new Set();
+    for (const [id, player] of sim.players) {
+      if (player.order.type !== "deliver") continue;
+      const { cubeId, destCx, destCz } = player.order;
+      const cubeSnap = currSnap.cubes[cubeId];
+      if (!cubeSnap) continue;
+      activeIds.add(id);
+
+      const dest = cellCenter(destCx, destCz);
+      let originX, originZ;
+      if (cubeSnap.carriedBy) {
+        const carrierMesh = playerMeshes.get(cubeSnap.carriedBy);
+        originX = carrierMesh ? carrierMesh.position.x : dest.x;
+        originZ = carrierMesh ? carrierMesh.position.z : dest.z;
+      } else {
+        const origin = cellCenter(cubeSnap.cx, cubeSnap.cz);
+        originX = origin.x;
+        originZ = origin.z;
+      }
+
+      let visuals = planVisuals.get(id);
+      if (!visuals) {
+        const color = COLORS[colorIndexById.get(id) % COLORS.length];
+        const ghost = new THREE.Mesh(
+          new THREE.BoxGeometry(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE),
+          new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.35 })
+        );
+        const line = new THREE.Line(
+          new THREE.BufferGeometry(),
+          new THREE.LineDashedMaterial({ color, dashSize: 0.25, gapSize: 0.15 })
+        );
+        scene.add(ghost);
+        scene.add(line);
+        visuals = { ghost, line };
+        planVisuals.set(id, visuals);
+      }
+
+      visuals.ghost.position.set(dest.x, CUBE_REST_Y, dest.z);
+      visuals.line.geometry.setFromPoints([
+        new THREE.Vector3(originX, CUBE_REST_Y, originZ),
+        new THREE.Vector3(dest.x, CUBE_REST_Y, dest.z),
+      ]);
+      visuals.line.computeLineDistances();
+    }
+
+    for (const [id, visuals] of planVisuals) {
+      if (activeIds.has(id)) continue;
+      scene.remove(visuals.ghost);
+      scene.remove(visuals.line);
+      visuals.ghost.geometry.dispose();
+      visuals.ghost.material.dispose();
+      visuals.line.geometry.dispose();
+      visuals.line.material.dispose();
+      planVisuals.delete(id);
+    }
+  }
+
+  function cancelSelection() {
+    selectedCubeId = null;
+    dragGhost.visible = false;
+  }
+
   // ---- clock sync ---------------------------------------------------------
   // Server timestamps every command with its own wall clock (execAt). We
   // estimate the offset between our clock and the server's once, using a
@@ -175,20 +281,70 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   const raycaster = new THREE.Raycaster();
   const pointerNDC = new THREE.Vector2();
 
-  canvas.addEventListener("pointerdown", (e) => {
+  function pointerToNDC(e) {
     const rect = canvas.getBoundingClientRect();
     pointerNDC.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     pointerNDC.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  }
+
+  canvas.addEventListener("pointermove", (e) => {
+    pointerToNDC(e);
     raycaster.setFromCamera(pointerNDC, camera);
 
+    if (selectedCubeId !== null) {
+      setHoveredCube(null);
+      const groundHit = raycaster.intersectObject(ground)[0];
+      if (groundHit) {
+        const { cx, cz } = worldToCell(groundHit.point.x, groundHit.point.z);
+        const c = cellCenter(cx, cz);
+        dragGhost.position.set(c.x, CUBE_REST_Y, c.z);
+        dragGhost.visible = true;
+      }
+      return;
+    }
+
+    const hit = raycaster.intersectObjects([...cubeMeshes.values()])[0];
+    if (hit) {
+      const cubeId = [...cubeMeshes.entries()].find(([, m]) => m === hit.object)?.[0];
+      const grounded = cubeId && currSnap.cubes[cubeId]?.carriedBy === null;
+      setHoveredCube(grounded ? cubeId : null);
+    } else {
+      setHoveredCube(null);
+    }
+  });
+
+  canvas.addEventListener("pointerdown", (e) => {
+    pointerToNDC(e);
+    raycaster.setFromCamera(pointerNDC, camera);
+
+    // Second click of a delivery plan: commit the destination and send the
+    // plan as a single command. What happens next (can the avatar actually
+    // get there and back) is entirely up to the sim — see sim.js.
+    if (selectedCubeId !== null) {
+      const groundHit = raycaster.intersectObject(ground)[0];
+      if (groundHit) {
+        ws.send(
+          JSON.stringify({
+            type: "cmd",
+            cmd: { kind: "move_block", cubeId: selectedCubeId, x: groundHit.point.x, z: groundHit.point.z },
+          })
+        );
+        showClickMarker(groundHit.point.x, groundHit.point.z);
+      }
+      cancelSelection();
+      return;
+    }
+
+    // First click: pick up a grounded cube as a pending plan (nothing sent
+    // to the server yet — that only happens once a destination is chosen).
     const cubeHit = raycaster.intersectObjects([...cubeMeshes.values()])[0];
     if (cubeHit) {
       const cubeId = [...cubeMeshes.entries()].find(([, m]) => m === cubeHit.object)?.[0];
-      if (cubeId) {
-        ws.send(JSON.stringify({ type: "cmd", cmd: { kind: "gather", cubeId } }));
-        showClickMarker(cubeHit.point.x, cubeHit.point.z);
+      if (cubeId && currSnap.cubes[cubeId]?.carriedBy === null) {
+        selectedCubeId = cubeId;
+        setHoveredCube(null);
+        return;
       }
-      return;
     }
 
     const groundHit = raycaster.intersectObject(ground)[0];
@@ -203,10 +359,17 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     }
   });
 
+  canvas.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    if (selectedCubeId !== null) cancelSelection();
+  });
+
   window.addEventListener("keydown", (e) => {
     if (e.code === "Space") {
       e.preventDefault();
       ws.send(JSON.stringify({ type: "cmd", cmd: { kind: "drop" } }));
+    } else if (e.code === "Escape" && selectedCubeId !== null) {
+      cancelSelection();
     }
   });
 
@@ -297,6 +460,8 @@ export function startGame({ ws, players, myId, spawns, seed }) {
         mesh.position.set(worldX, CUBE_REST_Y, worldZ);
       }
     }
+
+    updatePlanVisuals();
   }
 
   requestAnimationFrame(tick);
