@@ -18,9 +18,16 @@ const MAX_CATCHUP_MS = 100; // real time budget per frame for replaying missed t
 const PLAYER_RADIUS = 0.35;
 const PLAYER_LENGTH = 0.6;
 const PLAYER_REST_Y = PLAYER_LENGTH / 2 + PLAYER_RADIUS;
-const CUBE_SIZE = 0.8;
-const CUBE_REST_Y = CUBE_SIZE / 2;
-const CARRY_HEIGHT = PLAYER_REST_Y + PLAYER_LENGTH / 2 + CUBE_SIZE / 2 + 0.1;
+const CUBE_SIZE = CELL_SIZE; // full cell footprint -- blocks tile edge to edge, no gaps
+const RAMP_HEIGHT = CUBE_SIZE / 2; // half-height "slab", same color as a block
+// Carried cubes ride above whatever height the carrier is currently rendered
+// at (ground level, or elevated if they're standing on a stack) -- this is
+// an offset added to the carrier's own render Y, not an absolute height.
+const CARRY_HEIGHT_OFFSET = PLAYER_LENGTH / 2 + CUBE_SIZE / 2 + 0.1;
+
+function realHeightOf(cubeType) {
+  return cubeType === "ramp" ? RAMP_HEIGHT : CUBE_SIZE;
+}
 
 function shortestAngleDelta(from, to) {
   const twoPi = Math.PI * 2;
@@ -105,11 +112,18 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   scene.add(myMarker);
 
   // ---- cube meshes ----------------------------------------------------
+  // Ramps are just half-height "slabs" of the same material as a block --
+  // no color distinction, the shorter geometry is the only visual cue.
+  // Cubes can be gathered/restacked at any time (ramps included), so unlike
+  // static terrain, every cube's position is recomputed each frame in
+  // render() based on the live stack it's currently part of.
+  const CUBE_COLOR = 0xc48a5a;
   const cubeMeshes = new Map(); // cubeId -> mesh
   for (const cube of sim.cubes.values()) {
+    const height = realHeightOf(cube.type);
     const mesh = new THREE.Mesh(
-      new THREE.BoxGeometry(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE),
-      new THREE.MeshStandardMaterial({ color: 0xc48a5a })
+      new THREE.BoxGeometry(CUBE_SIZE, height, CUBE_SIZE),
+      new THREE.MeshStandardMaterial({ color: CUBE_COLOR })
     );
     scene.add(mesh);
     cubeMeshes.set(cube.id, mesh);
@@ -132,6 +146,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   // on its own whether it can actually walk the cube there (see sim.js).
   let hoveredCubeId = null;
   let selectedCubeId = null;
+  let selectedCubeHeight = CUBE_SIZE; // matches selectedCubeId's type (block/ramp); geometry swapped on select
   const myColorIndex = colorIndexById.get(myId) ?? 0;
 
   const dragGhost = new THREE.Mesh(
@@ -151,6 +166,46 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   // any extra network messages). Keyed by playerId, tinted with that
   // player's color.
   const planVisuals = new Map();
+
+  // Brute-force scans are fine here -- there are only ever ~18 cubes, and
+  // these run at most once per player/cube per rendered frame.
+
+  // Sum of real (visual) heights of every grounded cube in this column --
+  // i.e. the Y of the walkable surface a player standing here rests on.
+  function columnTopY(x, z) {
+    const { cx, cz } = worldToCell(x, z);
+    let y = 0;
+    for (const cube of sim.cubes.values()) {
+      if (cube.carriedBy === null && cube.cx === cx && cube.cz === cz) y += realHeightOf(cube.type);
+    }
+    return y;
+  }
+
+  // Sum of real heights of everything *below* a given cube in its column --
+  // i.e. the Y its own base rests on.
+  function cubeBaseY(cube) {
+    let y = 0;
+    for (const other of sim.cubes.values()) {
+      if (other.carriedBy === null && other.cx === cube.cx && other.cz === cube.cz && other.level < cube.level) {
+        y += realHeightOf(other.type);
+      }
+    }
+    return y;
+  }
+
+  // Can only gather/deliver-target the topmost cube in a column -- a buried
+  // cube's side faces can still be raycast-hit even though sim.js will
+  // reject picking it, so check explicitly rather than relying on occlusion.
+  function isGatherable(cubeId) {
+    const cube = sim.cubes.get(cubeId);
+    if (!cube || currSnap.cubes[cubeId]?.carriedBy !== null) return false;
+    for (const other of sim.cubes.values()) {
+      if (other.carriedBy === null && other.cx === cube.cx && other.cz === cube.cz && other.level > cube.level) {
+        return false;
+      }
+    }
+    return true;
+  }
 
   function setHoveredCube(cubeId) {
     if (cubeId === hoveredCubeId) return;
@@ -175,22 +230,26 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       activeIds.add(id);
 
       const dest = cellCenter(destCx, destCz);
-      let originX, originZ;
+      const ownHeight = realHeightOf(cubeSnap.type);
+      let originX, originZ, originY;
       if (cubeSnap.carriedBy) {
         const carrierMesh = playerMeshes.get(cubeSnap.carriedBy);
         originX = carrierMesh ? carrierMesh.position.x : dest.x;
         originZ = carrierMesh ? carrierMesh.position.z : dest.z;
+        originY = carrierMesh ? carrierMesh.position.y + CARRY_HEIGHT_OFFSET : ownHeight / 2;
       } else {
         const origin = cellCenter(cubeSnap.cx, cubeSnap.cz);
         originX = origin.x;
         originZ = origin.z;
+        originY = cubeBaseY(cubeSnap) + ownHeight / 2;
       }
+      const destY = columnTopY(dest.x, dest.z) + ownHeight / 2;
 
       let visuals = planVisuals.get(id);
       if (!visuals) {
         const color = COLORS[colorIndexById.get(id) % COLORS.length];
         const ghost = new THREE.Mesh(
-          new THREE.BoxGeometry(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE),
+          new THREE.BoxGeometry(CUBE_SIZE, ownHeight, CUBE_SIZE),
           new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.35 })
         );
         const line = new THREE.Line(
@@ -203,10 +262,10 @@ export function startGame({ ws, players, myId, spawns, seed }) {
         planVisuals.set(id, visuals);
       }
 
-      visuals.ghost.position.set(dest.x, CUBE_REST_Y, dest.z);
+      visuals.ghost.position.set(dest.x, destY, dest.z);
       visuals.line.geometry.setFromPoints([
-        new THREE.Vector3(originX, CUBE_REST_Y, originZ),
-        new THREE.Vector3(dest.x, CUBE_REST_Y, dest.z),
+        new THREE.Vector3(originX, originY, originZ),
+        new THREE.Vector3(dest.x, destY, dest.z),
       ]);
       visuals.line.computeLineDistances();
     }
@@ -296,7 +355,10 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       if (groundHit) {
         const { cx, cz } = worldToCell(groundHit.point.x, groundHit.point.z);
         const c = cellCenter(cx, cz);
-        dragGhost.position.set(c.x, CUBE_REST_Y, c.z);
+        // Preview where it'll actually land: on top of whatever's already
+        // stacked in that column, not always at ground level.
+        const topY = columnTopY(c.x, c.z);
+        dragGhost.position.set(c.x, topY + selectedCubeHeight / 2, c.z);
         dragGhost.visible = true;
       }
       return;
@@ -305,8 +367,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     const hit = raycaster.intersectObjects([...cubeMeshes.values()])[0];
     if (hit) {
       const cubeId = [...cubeMeshes.entries()].find(([, m]) => m === hit.object)?.[0];
-      const grounded = cubeId && currSnap.cubes[cubeId]?.carriedBy === null;
-      setHoveredCube(grounded ? cubeId : null);
+      setHoveredCube(cubeId && isGatherable(cubeId) ? cubeId : null);
     } else {
       setHoveredCube(null);
     }
@@ -339,8 +400,11 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     const cubeHit = raycaster.intersectObjects([...cubeMeshes.values()])[0];
     if (cubeHit) {
       const cubeId = [...cubeMeshes.entries()].find(([, m]) => m === cubeHit.object)?.[0];
-      if (cubeId && currSnap.cubes[cubeId]?.carriedBy === null) {
+      if (cubeId && isGatherable(cubeId)) {
         selectedCubeId = cubeId;
+        selectedCubeHeight = realHeightOf(sim.cubes.get(cubeId)?.type);
+        dragGhost.geometry.dispose();
+        dragGhost.geometry = new THREE.BoxGeometry(CUBE_SIZE, selectedCubeHeight, CUBE_SIZE);
         setHoveredCube(null);
         return;
       }
@@ -456,7 +520,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       const x = a.x + (b.x - a.x) * alpha;
       const z = a.z + (b.z - a.z) * alpha;
       const facing = lerpAngle(a.facing, b.facing, alpha);
-      mesh.position.set(x, PLAYER_REST_Y, z);
+      mesh.position.set(x, PLAYER_REST_Y + columnTopY(x, z), z);
       mesh.rotation.y = facing;
 
       if (id === myId) {
@@ -471,12 +535,13 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       if (c.carriedBy) {
         const carrierMesh = playerMeshes.get(c.carriedBy);
         if (carrierMesh) {
-          mesh.position.set(carrierMesh.position.x, CARRY_HEIGHT, carrierMesh.position.z);
+          mesh.position.set(carrierMesh.position.x, carrierMesh.position.y + CARRY_HEIGHT_OFFSET, carrierMesh.position.z);
         }
       } else {
         const worldX = (c.cx - GRID_SIZE / 2 + 0.5) * CELL_SIZE;
         const worldZ = (c.cz - GRID_SIZE / 2 + 0.5) * CELL_SIZE;
-        mesh.position.set(worldX, CUBE_REST_Y, worldZ);
+        const baseY = cubeBaseY(c);
+        mesh.position.set(worldX, baseY + realHeightOf(c.type) / 2, worldZ);
       }
     }
 

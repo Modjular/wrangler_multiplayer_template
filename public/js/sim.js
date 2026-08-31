@@ -15,6 +15,8 @@
 export const GRID_SIZE = 20;
 export const CELL_SIZE = 1;
 export const CUBE_COUNT = 18;
+export const RAMP_CHANCE = 0.25; // fraction of generated cubes that become ramps
+export const MAX_STACK_HEIGHT = 4; // cap how tall a column of cubes can get
 export const BASE_SPEED = 3.2; // units/sec
 export const ARRIVE_EPSILON = 0.05;
 
@@ -83,20 +85,54 @@ function inBounds(cx, cz) {
   return cx >= 0 && cx < GRID_SIZE && cz >= 0 && cz < GRID_SIZE;
 }
 
-// TODO(ramps): cubes are currently pure walls — isWalkable() always treats an
-// occupied cell as impassable. A future "ramp" cube type should be walkable
-// *on top of* (an elevated platform, not just an obstacle), which will need
-// its own case here and in the renderer. Deliberately out of scope for the
-// delivery-plan feature below.
-function cubeAtCell(sim, cx, cz) {
+// Cubes stack: a grid cell is a *column*, and each cube in it sits at an
+// integer `level` (0 = resting on the ground, 1 = resting on whatever's at
+// level 0, etc.) with no gaps — gather only ever removes the topmost cube in
+// a column (see applyCommand), so the stack can never end up with a hole.
+// columnHeight() is how many cubes are piled there, i.e. also the level a
+// newly-delivered cube would land on and the height a player stands at when
+// they're in this column.
+function columnHeight(sim, cx, cz) {
+  let count = 0;
   for (const cube of sim.cubes.values()) {
-    if (cube.carriedBy === null && cube.cx === cx && cube.cz === cz) return cube;
+    if (cube.carriedBy === null && cube.cx === cx && cube.cz === cz) count++;
   }
-  return null;
+  return count;
 }
 
-function isWalkable(sim, cx, cz) {
-  return inBounds(cx, cz) && !cubeAtCell(sim, cx, cz);
+function topCubeAt(sim, cx, cz) {
+  let top = null;
+  for (const cube of sim.cubes.values()) {
+    if (cube.carriedBy === null && cube.cx === cx && cube.cz === cz) {
+      if (!top || cube.level > top.level) top = cube;
+    }
+  }
+  return top;
+}
+
+// Can a player standing in column (fromCx,fromCz) step into the adjacent
+// column (toCx,toCz)? Flat moves and stepping down are always fine (like
+// walking off a ledge); stepping up by exactly one level requires the
+// destination's topmost cube to be a ramp -- that's the entire "ramps let
+// you climb, bare blocks are walls" mechanic. Climbing more than one level
+// in a single step is never allowed, no matter what's there.
+function canStep(sim, fromCx, fromCz, toCx, toCz) {
+  if (!inBounds(toCx, toCz)) return false;
+  const fromHeight = columnHeight(sim, fromCx, fromCz);
+  const toHeight = columnHeight(sim, toCx, toCz);
+  if (toHeight <= fromHeight) return true;
+  if (toHeight === fromHeight + 1) {
+    const top = topCubeAt(sim, toCx, toCz);
+    return top !== null && top.type === "ramp";
+  }
+  return false;
+}
+
+// Diagonal moves are kept simple: same-height only. Climbing/descending is
+// only ever done by stepping orthogonally onto a ramp -- otherwise corner
+// cases like "diagonal climb past the corner of a block" get ambiguous fast.
+function isFlatStep(sim, fromCx, fromCz, toCx, toCz) {
+  return canStep(sim, fromCx, fromCz, toCx, toCz) && columnHeight(sim, fromCx, fromCz) === columnHeight(sim, toCx, toCz);
 }
 
 // Generates the scattered cube layout from the match seed. Every client calls
@@ -116,8 +152,9 @@ function generateCubes(seed, excludeCells) {
     if (excluded.has(key)) continue;
     if ([...cubes.values()].some((c) => c.cx === cx && c.cz === cz)) continue;
     const weight = 1 + Math.floor(rng() * 3); // 1..3
+    const type = rng() < RAMP_CHANCE ? "ramp" : "block";
     const cubeId = `cube_${id++}`;
-    cubes.set(cubeId, { id: cubeId, cx, cz, weight, carriedBy: null });
+    cubes.set(cubeId, { id: cubeId, cx, cz, level: 0, weight, type, carriedBy: null });
   }
   return cubes;
 }
@@ -146,30 +183,15 @@ export function createSimulation({ seed, players }) {
 
 // 8-directional A* over the grid. Returns a list of world-space waypoints
 // (cell centers), with the final waypoint replaced by the exact requested
-// point if its cell is walkable. Returns [] if unreachable.
+// point. Returns [] if unreachable -- every column is a valid destination in
+// principle (you can always be standing in it, at its own height), so
+// "unreachable" now purely means no climbable route gets you there, not that
+// the cell itself is off-limits. Unlike before ramps existed, there's no
+// "nearest walkable cell" fallback: a click on a spot you can't climb to
+// just fails, the same way a boxed-in gather/delivery already does.
 function findPath(sim, fromX, fromZ, toX, toZ) {
   const start = worldToCell(fromX, fromZ);
-  let goal = worldToCell(toX, toZ);
-
-  if (!isWalkable(sim, goal.cx, goal.cz)) {
-    // fall back to the nearest walkable cell to the click
-    let best = null;
-    let bestDist = Infinity;
-    for (let dx = -2; dx <= 2; dx++) {
-      for (let dz = -2; dz <= 2; dz++) {
-        const cx = goal.cx + dx;
-        const cz = goal.cz + dz;
-        if (!isWalkable(sim, cx, cz)) continue;
-        const d = dx * dx + dz * dz;
-        if (d < bestDist) {
-          bestDist = d;
-          best = { cx, cz };
-        }
-      }
-    }
-    if (!best) return [];
-    goal = best;
-  }
+  const goal = worldToCell(toX, toZ);
 
   if (start.cx === goal.cx && start.cz === goal.cz) {
     return [{ x: toX, z: toZ }];
@@ -210,12 +232,18 @@ function findPath(sim, fromX, fromZ, toX, toZ) {
     for (const [dx, dz, cost] of NEIGHBORS_8) {
       const ncx = current.cx + dx;
       const ncz = current.cz + dz;
-      if (!isWalkable(sim, ncx, ncz)) continue;
-      if (dx !== 0 && dz !== 0) {
-        // prevent cutting across the corner of two blocked cells
-        if (!isWalkable(sim, current.cx + dx, current.cz) || !isWalkable(sim, current.cx, current.cz + dz)) {
+      const isDiagonal = dx !== 0 && dz !== 0;
+      if (isDiagonal) {
+        if (!isFlatStep(sim, current.cx, current.cz, ncx, ncz)) continue;
+        // prevent cutting across the corner of two blocked/mismatched-height cells
+        if (
+          !isFlatStep(sim, current.cx, current.cz, current.cx + dx, current.cz) ||
+          !isFlatStep(sim, current.cx, current.cz, current.cx, current.cz + dz)
+        ) {
           continue;
         }
+      } else if (!canStep(sim, current.cx, current.cz, ncx, ncz)) {
+        continue;
       }
       const nkey = key(ncx, ncz);
       if (closed.has(nkey)) continue;
@@ -231,16 +259,21 @@ function findPath(sim, fromX, fromZ, toX, toZ) {
   return [];
 }
 
-// Finds the shortest path to a walkable cell adjacent to (targetCx, targetCz)
-// — used both to approach a cube for gathering and to approach a delivery
-// destination for dropping, since neither the cube itself nor (once dropped)
-// the destination cell is something a player can stand on.
-function findAdjacentApproach(sim, fromX, fromZ, targetCx, targetCz) {
+// Finds the shortest path to a cell adjacent to (targetCx, targetCz) whose
+// own column height exactly matches `requiredHeight` -- used both to
+// approach a cube for gathering (stand level with the cube itself, which is
+// always the topmost thing in its column) and to approach a delivery
+// destination for dropping (stand level with the column's current top, so
+// the new cube lands right on top of it). Reusing findPath means the
+// approach cell also has to be climbably *reachable*, not just adjacent and
+// the right height -- a ramp-less wall around it still blocks the plan.
+function findApproachAtHeight(sim, fromX, fromZ, targetCx, targetCz, requiredHeight) {
   let best = null;
   for (const [dx, dz] of NEIGHBORS_4) {
     const cx = targetCx + dx;
     const cz = targetCz + dz;
-    if (!isWalkable(sim, cx, cz)) continue;
+    if (!inBounds(cx, cz)) continue;
+    if (columnHeight(sim, cx, cz) !== requiredHeight) continue;
     const center = cellCenter(cx, cz);
     const path = findPath(sim, fromX, fromZ, center.x, center.z);
     if (!path.length && !(fromX === center.x && fromZ === center.z)) continue;
@@ -275,7 +308,10 @@ export function applyCommand(sim, playerId, cmd) {
     case "gather": {
       const cube = sim.cubes.get(cmd.cubeId);
       if (!cube || cube.carriedBy !== null || player.carrying !== null) return;
-      const path = findAdjacentApproach(sim, player.x, player.z, cube.cx, cube.cz);
+      // Can only grab the topmost cube in a column -- anything else has a
+      // cube resting on it and physically can't be reached.
+      if (cube.level !== columnHeight(sim, cube.cx, cube.cz) - 1) return;
+      const path = findApproachAtHeight(sim, player.x, player.z, cube.cx, cube.cz, cube.level);
       player.order = path.length
         ? { type: "gather", cubeId: cmd.cubeId, path, pathIndex: 0 }
         : { type: "idle" };
@@ -292,14 +328,16 @@ export function applyCommand(sim, playerId, cmd) {
     case "move_block": {
       const cube = sim.cubes.get(cmd.cubeId);
       if (!cube || cube.carriedBy !== null || player.carrying !== null) return;
+      if (cube.level !== columnHeight(sim, cube.cx, cube.cz) - 1) return;
       const { cx: destCx, cz: destCz } = worldToCell(cmd.x, cmd.z);
-      if (!isWalkable(sim, destCx, destCz)) {
+      if (!inBounds(destCx, destCz)) return;
+      if (columnHeight(sim, destCx, destCz) >= MAX_STACK_HEIGHT) {
         console.warn(
-          `[sim] move_block: destination (${destCx},${destCz}) for cube ${cmd.cubeId} isn't walkable, plan rejected`
+          `[sim] move_block: destination (${destCx},${destCz}) for cube ${cmd.cubeId} is already at max stack height, plan rejected`
         );
         return;
       }
-      const path = findAdjacentApproach(sim, player.x, player.z, cube.cx, cube.cz);
+      const path = findApproachAtHeight(sim, player.x, player.z, cube.cx, cube.cz, cube.level);
       if (!path.length) {
         console.warn(
           `[sim] move_block: player ${playerId} has no path to cube ${cmd.cubeId}, plan rejected`
@@ -324,11 +362,14 @@ export function applyCommand(sim, playerId, cmd) {
       const [dx, dz] = OCTANTS[octant];
       const targetCx = cx + dx;
       const targetCz = cz + dz;
-      if (!isWalkable(sim, targetCx, targetCz)) return;
+      if (!inBounds(targetCx, targetCz)) return;
+      const targetHeight = columnHeight(sim, targetCx, targetCz);
+      if (targetHeight >= MAX_STACK_HEIGHT) return;
       const cube = sim.cubes.get(player.carrying);
       cube.carriedBy = null;
       cube.cx = targetCx;
       cube.cz = targetCz;
+      cube.level = targetHeight;
       player.carrying = null;
       break;
     }
@@ -378,7 +419,8 @@ export function step(sim, dt) {
 
     if (orderType === "gather") {
       const target = sim.cubes.get(player.order.cubeId);
-      if (target && target.carriedBy === null) {
+      const stillTopmost = target && target.level === columnHeight(sim, target.cx, target.cz) - 1;
+      if (target && target.carriedBy === null && stillTopmost) {
         target.carriedBy = player.id;
         player.carrying = target.id;
       }
@@ -391,7 +433,8 @@ export function step(sim, dt) {
 
       if (player.order.phase === "to_cube") {
         const target = sim.cubes.get(cubeId);
-        if (!target || target.carriedBy !== null) {
+        const stillTopmost = target && target.level === columnHeight(sim, target.cx, target.cz) - 1;
+        if (!target || target.carriedBy !== null || !stillTopmost) {
           console.warn(`[sim] deliver: cube ${cubeId} is no longer available, plan abandoned`);
           player.order = { type: "idle" };
           continue;
@@ -399,7 +442,15 @@ export function step(sim, dt) {
         target.carriedBy = player.id;
         player.carrying = target.id;
 
-        const path = findAdjacentApproach(sim, player.x, player.z, destCx, destCz);
+        const destHeight = columnHeight(sim, destCx, destCz);
+        if (destHeight >= MAX_STACK_HEIGHT) {
+          console.warn(
+            `[sim] deliver: destination (${destCx},${destCz}) for cube ${cubeId} is already at max stack height, plan abandoned (still carrying)`
+          );
+          player.order = { type: "idle" };
+          continue;
+        }
+        const path = findApproachAtHeight(sim, player.x, player.z, destCx, destCz, destHeight);
         if (!path.length) {
           console.warn(
             `[sim] deliver: player ${player.id} has no path to destination (${destCx},${destCz}) for cube ${cubeId}, plan abandoned (still carrying)`
@@ -412,9 +463,10 @@ export function step(sim, dt) {
       }
 
       // phase === "to_dest"
-      if (!isWalkable(sim, destCx, destCz)) {
+      const destHeight = columnHeight(sim, destCx, destCz);
+      if (destHeight >= MAX_STACK_HEIGHT) {
         console.warn(
-          `[sim] deliver: destination (${destCx},${destCz}) for cube ${cubeId} became blocked, plan abandoned (still carrying)`
+          `[sim] deliver: destination (${destCx},${destCz}) for cube ${cubeId} became full, plan abandoned (still carrying)`
         );
         player.order = { type: "idle" };
         continue;
@@ -423,6 +475,7 @@ export function step(sim, dt) {
       deliveredCube.carriedBy = null;
       deliveredCube.cx = destCx;
       deliveredCube.cz = destCz;
+      deliveredCube.level = destHeight;
       player.carrying = null;
       player.order = { type: "idle" };
       continue;
@@ -443,7 +496,7 @@ export function snapshot(sim) {
   }
   const cubes = {};
   for (const [id, c] of sim.cubes) {
-    cubes[id] = { cx: c.cx, cz: c.cz, weight: c.weight, carriedBy: c.carriedBy };
+    cubes[id] = { cx: c.cx, cz: c.cz, level: c.level, type: c.type, weight: c.weight, carriedBy: c.carriedBy };
   }
   return { players, cubes };
 }
