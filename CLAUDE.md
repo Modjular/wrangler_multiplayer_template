@@ -6,8 +6,8 @@ This project runs a **lockstep** netcode model, not a server-authoritative
 one. Keep this in mind before changing anything in `GameRoom.js` or `sim.js`.
 
 - **The server never simulates the game.** `src/GameRoom.js` is a dumb
-  relay: clients send high-level commands (`move` / `gather` / `drop`), the
-  server does minimal shape/bounds validation (`sanitizeCommand` +
+  relay: clients send high-level commands (`move` / `gather` / `drop` /
+  `move_block`), the server does minimal shape/bounds validation (`sanitizeCommand` +
   `VALID_CMD_KINDS`) so a malformed or hostile client can't crash *other*
   clients' sims, stamps each command with a sequence number and an `execAt`
   timestamp (`Date.now() + INPUT_DELAY_MS`, currently 200ms), and broadcasts
@@ -42,6 +42,69 @@ result is a silent per-client desync, not a crash, so it's easy to miss in
 testing. If a future feature needs real anti-cheat or authoritative state,
 that's a deliberate architecture change, not an incremental tweak — flag it
 rather than bolting server-side validation onto one command at a time.
+
+## World model: stacking, ramps, and the "forklift" rule
+
+Cubes stack in integer-`level` columns (`columnHeight()` in `sim.js`), no
+gaps — gather only ever removes the topmost cube. Climbing is gated by
+`canStep()`: flat moves and stepping *down* are always legal; stepping *up*
+by exactly one level requires a ramp on top of the destination column;
+anything more is blocked outright. This is also why gathering or
+delivering a cube requires standing at a column exactly level with it
+(`findApproachAtHeight`) — you reach sideways at the same height, never up
+or down. Two ramps stacked on each other form a full-height "block" that's
+only reachable to regrab if some *adjacent* column happens to be at the
+right height; that's intentional ("forklift" logic), not a bug.
+
+`approachCells` / `reachableColumns` / `reachableColumnsFromApproach` /
+`hasReachableApproach` in `sim.js` re-derive this same rule as a
+reachability flood fill, purely so `game.js` can show a UI hint (tint the
+delivery-ghost preview red when a planned delivery isn't actually
+reachable) without duplicating the stepping logic. If you change
+`canStep`/`findApproachAtHeight`, check whether these need the same
+change, or the hint and the real outcome will silently disagree — this has
+already happened once (seeding the flood fill from a cube's own column
+instead of its approach cells, which is one level too tall).
+
+## Client-only rendering tricks must never touch `sim`
+
+Several purely-visual features in `game.js` re-run `sim.js`'s own
+deterministic functions (`findPath`, `advanceAlongPath`,
+`reachableColumns`, etc.) directly, entirely outside the lockstep
+command/step loop:
+- **Local move prediction** (`myPrediction`): walks the local player's own
+  avatar instantly on click, ahead of the ~200ms lockstep round trip.
+- **Delivery-reachability hint** (see above): a reachability flood fill
+  computed once at pickup and memoized for the whole drag gesture.
+- **A*-traced plan line**: draws the dashed delivery path by reading the
+  cube's real `order.path` once picked up — frozen for that phase, not
+  re-derived every frame (`frozenDeliverOrigin`), so it holds still and
+  can never disagree with where the avatar actually walks. Before pickup
+  there's no authoritative route yet, so it's a fresh `findPath` preview
+  instead.
+- **Movement "juice"** (spring-smoothed follow + lean): a `smoothDamp`-based
+  visual chase of the authoritative interpolated position.
+
+None of these mutate `sim` or send anything over the wire — that's what
+makes them safe despite running ahead of / independent from the
+lockstep loop. If you add another one, keep it strictly read-only against
+`sim`; anything that *writes* game state has to go through
+`applyCommand`/`step()` so every client computes the identical result.
+
+## Delivery job queue
+
+Each player has a `queue` array (`sim.js`) of pending `move_block` jobs.
+If a player is busy (`order.type !== "idle"`) when a `move_block` command
+arrives, it's queued instead of dropped or interrupting the active order;
+`step()` drains the front of the queue (via the shared `tryStartDeliver`
+helper, also used for an immediate start when idle) every tick a player
+goes idle, skipping — not getting stuck on — any queued job that's no
+longer valid by the time its turn comes up (its cube was taken, its
+destination filled up). An explicit `move` or `drop` command clears the
+queue, since those are the player taking direct manual control. A new
+queueable order kind needs the same three pieces: enqueue-when-busy in
+`applyCommand`, a `tryStart*`-style validator, and a drain call in
+`step()`.
 
 ## Local dev server
 
