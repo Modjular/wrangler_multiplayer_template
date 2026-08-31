@@ -124,7 +124,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   // it's a pure translation, the ground-plane point under any given screen
   // position also translates by exactly the same amount the rig does,
   // which is what makes intersectGroundPlaneY0-based dragging exact (see
-  // panCameraBy).
+  // panTo).
   const CAMERA_OFFSET = { x: 0, y: mapExtent * 1.1, z: mapExtent * 0.95 };
   const cameraLookTarget = { x: 0, z: 0 };
   const PAN_LIMIT = mapExtent * 0.85;
@@ -432,6 +432,10 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   // drag (pan the camera). Desktop's mouse/pen flow below is untouched.
   const PAN_DRAG_THRESHOLD_PX = 10;
   let touchGesture = null; // { type: "block" } | { type: "pending", panAnchor } | { type: "pan", panAnchor }
+  // Only one finger drives a gesture at a time -- an incidental second touch
+  // (e.g. a resting thumb) while dragging must not hijack touchGesture out
+  // from under the finger that's actually mid-drag.
+  let activeTouchPointerId = null;
 
   // Ray-vs-infinite-Y=0-plane intersection (not limited to the finite
   // `ground` mesh) -- panning needs a world point even when the finger is
@@ -482,20 +486,29 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     cancelSelection();
   }
 
+  // Snaps the drag ghost to whatever grid cell (clientX, clientY) is over,
+  // stacked on top of that column's current contents. Shared by the desktop
+  // hover-preview and the touch drag-preview so the two input modes can't
+  // silently disagree on where a cube will land.
+  function updateDragGhostAt(clientX, clientY) {
+    pointerToNDC({ clientX, clientY });
+    raycaster.setFromCamera(pointerNDC, camera);
+    const groundHit = raycaster.intersectObject(ground)[0];
+    if (groundHit) {
+      const { cx, cz } = worldToCell(groundHit.point.x, groundHit.point.z);
+      const c = cellCenter(cx, cz);
+      const topY = columnTopY(c.x, c.z);
+      dragGhost.position.set(c.x, topY + selectedCubeHeight / 2, c.z);
+      dragGhost.visible = true;
+    }
+  }
+
   function handleTouchMove(e) {
+    if (e.pointerId !== activeTouchPointerId) return;
     if (!touchGesture) return;
 
     if (touchGesture.type === "block") {
-      pointerToNDC(e);
-      raycaster.setFromCamera(pointerNDC, camera);
-      const groundHit = raycaster.intersectObject(ground)[0];
-      if (groundHit) {
-        const { cx, cz } = worldToCell(groundHit.point.x, groundHit.point.z);
-        const c = cellCenter(cx, cz);
-        const topY = columnTopY(c.x, c.z);
-        dragGhost.position.set(c.x, topY + selectedCubeHeight / 2, c.z);
-        dragGhost.visible = true;
-      }
+      updateDragGhostAt(e.clientX, e.clientY);
       return;
     }
 
@@ -522,16 +535,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
 
     if (selectedCubeId !== null) {
       setHoveredCube(null);
-      const groundHit = raycaster.intersectObject(ground)[0];
-      if (groundHit) {
-        const { cx, cz } = worldToCell(groundHit.point.x, groundHit.point.z);
-        const c = cellCenter(cx, cz);
-        // Preview where it'll actually land: on top of whatever's already
-        // stacked in that column, not always at ground level.
-        const topY = columnTopY(c.x, c.z);
-        dragGhost.position.set(c.x, topY + selectedCubeHeight / 2, c.z);
-        dragGhost.visible = true;
-      }
+      updateDragGhostAt(e.clientX, e.clientY);
       return;
     }
 
@@ -549,6 +553,11 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     raycaster.setFromCamera(pointerNDC, camera);
 
     if (e.pointerType === "touch") {
+      // A gesture is already in progress under a different finger (e.g. a
+      // resting thumb) -- ignore this touch entirely rather than letting it
+      // hijack touchGesture out from under the finger actually driving it.
+      if (activeTouchPointerId !== null && e.pointerId !== activeTouchPointerId) return;
+
       if (selectedCubeId !== null) {
         // Rare: an earlier tap already armed a plan (e.g. tap-select then a
         // separate tap-place instead of one continuous drag) -- commit it
@@ -564,6 +573,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
         if (cubeId && isGatherable(cubeId)) {
           beginCubeSelection(cubeId);
           touchGesture = { type: "block" };
+          activeTouchPointerId = e.pointerId;
           return;
         }
       }
@@ -576,6 +586,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
         startClientY: e.clientY,
         panAnchor: intersectGroundPlaneY0(e.clientX, e.clientY),
       };
+      activeTouchPointerId = e.pointerId;
       return;
     }
 
@@ -600,19 +611,12 @@ export function startGame({ ws, players, myId, spawns, seed }) {
 
     const groundHit = raycaster.intersectObject(ground)[0];
     if (groundHit) {
-      ws.send(
-        JSON.stringify({
-          type: "cmd",
-          cmd: { kind: "move", x: groundHit.point.x, z: groundHit.point.z },
-        })
-      );
-      showClickMarker(groundHit.point.x, groundHit.point.z);
-      startMyPrediction(groundHit.point.x, groundHit.point.z);
+      sendMyMove(groundHit.point.x, groundHit.point.z);
     }
   });
 
   canvas.addEventListener("pointerup", (e) => {
-    if (e.pointerType !== "touch" || !touchGesture) return;
+    if (e.pointerType !== "touch" || !touchGesture || e.pointerId !== activeTouchPointerId) return;
 
     if (touchGesture.type === "block") {
       pointerToNDC(e);
@@ -625,21 +629,20 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       raycaster.setFromCamera(pointerNDC, camera);
       const groundHit = raycaster.intersectObject(ground)[0];
       if (groundHit) {
-        ws.send(
-          JSON.stringify({ type: "cmd", cmd: { kind: "move", x: groundHit.point.x, z: groundHit.point.z } })
-        );
-        showClickMarker(groundHit.point.x, groundHit.point.z);
-        startMyPrediction(groundHit.point.x, groundHit.point.z);
+        sendMyMove(groundHit.point.x, groundHit.point.z);
       }
     }
     // type "pan": nothing to commit, just stop panning.
 
     touchGesture = null;
+    activeTouchPointerId = null;
   });
 
-  canvas.addEventListener("pointercancel", () => {
+  canvas.addEventListener("pointercancel", (e) => {
+    if (e.pointerId !== activeTouchPointerId) return;
     if (selectedCubeId !== null) cancelSelection();
     touchGesture = null;
+    activeTouchPointerId = null;
   });
 
   canvas.addEventListener("contextmenu", (e) => {
@@ -656,6 +659,15 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       cancelSelection();
     }
   });
+
+  // Sends a "move" command and kicks off local prediction for it -- shared
+  // by the desktop ground-click and the touch tap-to-move handler so the
+  // two input modes can't silently diverge.
+  function sendMyMove(x, z) {
+    ws.send(JSON.stringify({ type: "cmd", cmd: { kind: "move", x, z } }));
+    showClickMarker(x, z);
+    startMyPrediction(x, z);
+  }
 
   function showClickMarker(x, z) {
     clickMarker.position.x = x;
@@ -679,10 +691,27 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   // 200ms window). A rare correction beats guaranteed lag on every click.
   // Scoped to "move" only -- gather/deliver/drop interact with contested
   // cube state in ways that are much riskier to predict well.
-  let myPrediction = null; // { x, z, facing, prevX, prevZ, prevFacing, order: {path, pathIndex}, sawAuthoritativeMove }
+  let myPrediction = null; // { x, z, facing, prevX, prevZ, prevFacing, order: {path, pathIndex}, targetMoveSeq }
+  // Counts my own "move" commands: `sentMoveCount` increments on every one I
+  // send, `appliedMoveCount` increments in applyDueCommands() when the
+  // authoritative sim actually applies one of mine. myPrediction stamps the
+  // sent-count value that corresponds to *its own* command (targetMoveSeq),
+  // so advanceMyPrediction can tell "the order is idle because my command
+  // hasn't been applied yet" apart from "the order is idle because it was
+  // just applied and immediately rejected" apart from "idle because an
+  // *older* command of mine finished" -- using the order's idle/non-idle
+  // state alone can't distinguish any of these, and confusing them either
+  // clears a still-in-flight prediction early (visible rubber-banding when
+  // clicking a new destination before the previous one's authoritative move
+  // has finished) or leaves a rejected one stuck forever (a locally
+  // "successful" prediction whose authoritative order never left "idle" at
+  // all, so it never looked non-idle in the first place).
+  let sentMoveCount = 0;
+  let appliedMoveCount = 0;
 
   function startMyPrediction(targetX, targetZ) {
     const myPlayer = sim.players.get(myId);
+    const targetMoveSeq = ++sentMoveCount;
     if (!myPlayer) return;
     const fromX = myPrediction ? myPrediction.x : myPlayer.x;
     const fromZ = myPrediction ? myPrediction.z : myPlayer.z;
@@ -700,7 +729,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       prevZ: fromZ,
       prevFacing: fromFacing,
       order: { path, pathIndex: 0 },
-      sawAuthoritativeMove: false,
+      targetMoveSeq,
     };
   }
 
@@ -717,14 +746,16 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       advanceAlongPath(myPrediction, speed, TICK_MS / 1000);
     }
 
-    // Only clear once we've actually seen the authoritative order come and
-    // go -- it's idle both before execAt hits *and* after the move
-    // finishes, so "currently idle" alone can't tell those apart.
-    const authOrder = sim.players.get(myId)?.order;
-    if (authOrder && authOrder.type !== "idle") {
-      myPrediction.sawAuthoritativeMove = true;
-    } else if (authOrder && authOrder.type === "idle" && myPrediction.sawAuthoritativeMove) {
-      myPrediction = null;
+    // Only clear once the authoritative sim has actually applied *this*
+    // prediction's own command (not a stale earlier or not-yet-arrived later
+    // one) and its resulting order has resolved back to idle -- immediately,
+    // if the authoritative path turned out to be unreachable, or once the
+    // walk finishes, otherwise.
+    if (appliedMoveCount >= myPrediction.targetMoveSeq) {
+      const authOrder = sim.players.get(myId)?.order;
+      if (authOrder && authOrder.type === "idle") {
+        myPrediction = null;
+      }
     }
   }
 
@@ -759,6 +790,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       if (localExecAt > simClock) break;
       pendingCommands.shift();
       applyCommand(sim, next.playerId, next.cmd);
+      if (next.playerId === myId && next.cmd.kind === "move") appliedMoveCount++;
     }
   }
 
