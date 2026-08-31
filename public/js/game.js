@@ -11,9 +11,15 @@ import {
   findPath,
   advanceAlongPath,
   BASE_SPEED,
+  columnHeight,
+  reachableColumns,
+  reachableColumnsFromApproach,
+  hasReachableApproach,
+  MAX_STACK_HEIGHT,
 } from "./sim.js";
 
 const COLORS = [0xff6b6b, 0x4ecdc4, 0xffe66d, 0x95e1d3, 0xa78bfa];
+const INVALID_GHOST_COLOR = 0xff4444; // drag-ghost tint when the hovered destination isn't actually reachable
 
 const TICK_MS = 50; // 20Hz fixed simulation step, decoupled from render rate
 const MAX_CATCHUP_MS = 100; // real time budget per frame for replaying missed ticks
@@ -223,6 +229,21 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   let hoveredCubeId = null;
   let selectedCubeId = null;
   let selectedCubeHeight = CUBE_SIZE; // matches selectedCubeId's type (block/ramp); geometry swapped on select
+  // Memoized "forklift rule" reachability for the current selection (see
+  // beginCubeSelection) -- computed once per pickup, not once per hover
+  // frame/candidate, since it only depends on the player's position and the
+  // cube's position, neither of which changes just from moving the ghost
+  // around. selectedCubeFetchable: can I even reach *this cube* from where
+  // I'm standing right now (both gather and the "to_cube" phase of a
+  // delivery require standing level with it -- see findApproachAtHeight).
+  // selectedCubeReachableFromPickup: everywhere reachable from the cube's
+  // *approach* cells -- i.e. from wherever I'll actually be standing once
+  // I've picked it up -- used to validate each candidate delivery
+  // destination as the ghost moves. Null while nothing is selected or the
+  // cube can't be fetched at all (no destination could ever work then
+  // either).
+  let selectedCubeFetchable = false;
+  let selectedCubeReachableFromPickup = null;
   const myColorIndex = colorIndexById.get(myId) ?? 0;
 
   const dragGhost = new THREE.Mesh(
@@ -235,6 +256,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   );
   dragGhost.visible = false;
   scene.add(dragGhost);
+  window.__dragGhost = dragGhost; // debug/test hook: inspect the placement-preview ghost
 
   // One ghost + dashed line per player currently carrying out a "deliver"
   // plan (their own or anyone else's — this is read straight off the
@@ -242,6 +264,14 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   // any extra network messages). Keyed by playerId, tinted with that
   // player's color.
   const planVisuals = new Map();
+  window.__planVisuals = planVisuals; // debug/test hook: inspect the plan-line ghost/line meshes
+  // playerId -> { key, waypoints } cache for the A*-traced plan line below.
+  // findPath is a full grid-wide search -- too expensive to rerun every
+  // render()'d frame (up to display refresh rate) when origin/dest have
+  // barely moved; only rerun it when the *cell* either one is in changes
+  // (waypoints are cell-centered anyway, so sub-cell motion can't change the
+  // route), which in practice is at most a few times over a whole delivery.
+  const planPathCache = new Map();
 
   // Brute-force scans are fine here -- there are only ever ~18 cubes, and
   // these run at most once per player/cube per rendered frame.
@@ -339,10 +369,31 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       }
 
       visuals.ghost.position.set(dest.x, destY, dest.z);
-      visuals.line.geometry.setFromPoints([
-        new THREE.Vector3(originX, originY, originZ),
-        new THREE.Vector3(dest.x, destY, dest.z),
-      ]);
+
+      // Trace the actual route (re-derived purely for rendering -- same
+      // trick as myPrediction's local walk, never touches `sim`) instead of
+      // a straight line, so it visibly bends around obstacles and up/down
+      // ramps the way the real delivery will. Only rerun the A* search when
+      // the origin/dest cell actually changed since last frame (see
+      // planPathCache above) -- falls back to a straight line if the world
+      // changed out from under a *fresh* query (e.g. another player just
+      // blocked the route) -- there's nothing better to draw in that case.
+      const originCell = worldToCell(originX, originZ);
+      const cacheKey = `${originCell.cx},${originCell.cz}->${destCx},${destCz}`;
+      const cached = planPathCache.get(id);
+      let waypoints;
+      if (cached && cached.key === cacheKey) {
+        waypoints = cached.waypoints;
+      } else {
+        waypoints = findPath(sim, originX, originZ, dest.x, dest.z);
+        planPathCache.set(id, { key: cacheKey, waypoints });
+      }
+      const points = [new THREE.Vector3(originX, originY, originZ)];
+      for (const wp of waypoints) {
+        points.push(new THREE.Vector3(wp.x, columnTopY(wp.x, wp.z) + ownHeight / 2, wp.z));
+      }
+      if (!waypoints.length) points.push(new THREE.Vector3(dest.x, destY, dest.z));
+      visuals.line.geometry.setFromPoints(points);
       visuals.line.computeLineDistances();
     }
 
@@ -355,11 +406,14 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       visuals.line.geometry.dispose();
       visuals.line.material.dispose();
       planVisuals.delete(id);
+      planPathCache.delete(id);
     }
   }
 
   function cancelSelection() {
     selectedCubeId = null;
+    selectedCubeFetchable = false;
+    selectedCubeReachableFromPickup = null;
     dragGhost.visible = false;
   }
 
@@ -470,6 +524,28 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     dragGhost.geometry.dispose();
     dragGhost.geometry = cubeGeometry(selectedCube?.type, selectedCube?.shape, selectedCubeHeight);
     setHoveredCube(null);
+
+    // Memoize reachability for this pickup (see the declaration up top):
+    // can I fetch it at all from here, and if so, what can I reach once I'm
+    // standing next to it (for validating delivery destinations below).
+    const myPlayer = sim.players.get(myId);
+    selectedCubeFetchable =
+      !!myPlayer &&
+      !!selectedCube &&
+      hasReachableApproach(
+        sim,
+        reachableColumns(sim, myPlayer.x, myPlayer.z),
+        selectedCube.cx,
+        selectedCube.cz,
+        selectedCube.level
+      );
+    // Seeded from the cube's *approach* cells (adjacent, at cube.level), not
+    // its own column -- the cube's own column is one level taller than
+    // where a player actually stands to reach it, which would make canStep
+    // over-permissive climbing out of it (see reachableColumnsFromApproach).
+    selectedCubeReachableFromPickup = selectedCubeFetchable
+      ? reachableColumnsFromApproach(sim, selectedCube.cx, selectedCube.cz, selectedCube.level)
+      : null;
   }
 
   function commitSelectedCubePlacement(groundHit) {
@@ -500,6 +576,19 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       const topY = columnTopY(c.x, c.z);
       dragGhost.position.set(c.x, topY + selectedCubeHeight / 2, c.z);
       dragGhost.visible = true;
+
+      // Tint red when this specific destination isn't actually deliverable
+      // right now -- either the cube itself can't be fetched from where I'm
+      // standing, this column's already full, or (using the memoized
+      // reachable-from-pickup set) there's nowhere level with it I could
+      // stand next to. Just a hint -- commit is still allowed either way,
+      // in case the world changes (or I move) between now and clicking.
+      const destHeight = columnHeight(sim, cx, cz);
+      const deliverable =
+        selectedCubeFetchable &&
+        destHeight < MAX_STACK_HEIGHT &&
+        hasReachableApproach(sim, selectedCubeReachableFromPickup, cx, cz, destHeight);
+      dragGhost.material.color.setHex(deliverable ? COLORS[myColorIndex % COLORS.length] : INVALID_GHOST_COLOR);
     }
   }
 
@@ -572,7 +661,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
         const cubeId = [...cubeMeshes.entries()].find(([, m]) => m === cubeHit.object)?.[0];
         if (cubeId && isGatherable(cubeId)) {
           beginCubeSelection(cubeId);
-          touchGesture = { type: "block" };
+          touchGesture = { type: "block", startClientX: e.clientX, startClientY: e.clientY };
           activeTouchPointerId = e.pointerId;
           return;
         }
@@ -619,9 +708,19 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     if (e.pointerType !== "touch" || !touchGesture || e.pointerId !== activeTouchPointerId) return;
 
     if (touchGesture.type === "block") {
-      pointerToNDC(e);
-      raycaster.setFromCamera(pointerNDC, camera);
-      commitSelectedCubePlacement(raycaster.intersectObject(ground)[0]);
+      const dx = e.clientX - touchGesture.startClientX;
+      const dy = e.clientY - touchGesture.startClientY;
+      if (Math.hypot(dx, dy) < PAN_DRAG_THRESHOLD_PX) {
+        // Released right where it was picked up, without actually dragging
+        // it anywhere -- committing here would raycast to roughly the
+        // cube's own spot and send a pointless "move it to where it already
+        // is" plan. Just cancel instead; a real placement needs a real drag.
+        cancelSelection();
+      } else {
+        pointerToNDC(e);
+        raycaster.setFromCamera(pointerNDC, camera);
+        commitSelectedCubePlacement(raycaster.intersectObject(ground)[0]);
+      }
     } else if (touchGesture.type === "pending") {
       // Released without dragging past the threshold: a tap, same as a
       // desktop click on empty ground.
@@ -771,6 +870,13 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   let lastFrameTime = Date.now();
   let simClock = Date.now();
 
+  // Reusable scratch objects for the yaw+lean composition in render() below
+  // -- avoids allocating fresh Quaternions/Vectors every player, every frame.
+  const _yawQuat = new THREE.Quaternion();
+  const _leanQuat = new THREE.Quaternion();
+  const _yAxis = new THREE.Vector3(0, 1, 0);
+  const _xAxis = new THREE.Vector3(1, 0, 0);
+
   // playerId -> spring-follow state for the movement "juice" (see smoothDamp above).
   const motionState = new Map();
   window.__motionState = motionState; // debug/test hook: inspect the spring-follow state
@@ -876,8 +982,17 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       m.lean += (targetLean - m.lean) * Math.min(1, dt / LEAN_SMOOTH_TIME);
 
       mesh.position.set(m.x, PLAYER_REST_Y + columnTopY(m.x, m.z), m.z);
-      mesh.rotation.y = facing;
-      mesh.rotation.x = m.lean;
+      // Lean has to tip the avatar's *own* forward axis, not a fixed world
+      // axis -- setting rotation.x directly (as before) always tips toward
+      // world +Z (i.e. toward the camera) no matter which way the avatar is
+      // actually facing. Composing yaw (world Y) with lean (the yawed
+      // mesh's own local X) gets the tip pointed the right way regardless
+      // of travel direction: qYaw * qLean applies qLean in the frame yaw
+      // already rotated into, which is exactly "lean forward relative to
+      // where I'm facing."
+      _yawQuat.setFromAxisAngle(_yAxis, facing);
+      _leanQuat.setFromAxisAngle(_xAxis, m.lean);
+      mesh.quaternion.copy(_yawQuat).multiply(_leanQuat);
 
       if (id === myId) {
         myMarker.position.x = m.x;
