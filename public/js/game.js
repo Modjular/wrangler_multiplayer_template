@@ -20,7 +20,12 @@ const PLAYER_LENGTH = 0.6;
 const PLAYER_REST_Y = PLAYER_LENGTH / 2 + PLAYER_RADIUS;
 const CUBE_SIZE = 0.8;
 const CUBE_REST_Y = CUBE_SIZE / 2;
-const CARRY_HEIGHT = PLAYER_REST_Y + PLAYER_LENGTH / 2 + CUBE_SIZE / 2 + 0.1;
+const RAMP_HEIGHT = CUBE_SIZE / 2; // shorter than a block cube, reads as a step up rather than a wall
+const RAMP_REST_Y = RAMP_HEIGHT / 2;
+// Carried cubes ride above whatever height the carrier is currently rendered
+// at (ground level, or elevated if they're standing on a ramp) -- this is an
+// offset added to the carrier's own render Y, not an absolute height.
+const CARRY_HEIGHT_OFFSET = PLAYER_LENGTH / 2 + CUBE_SIZE / 2 + 0.1;
 
 function shortestAngleDelta(from, to) {
   const twoPi = Math.PI * 2;
@@ -105,8 +110,22 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   scene.add(myMarker);
 
   // ---- cube meshes ----------------------------------------------------
+  // Ramps are terrain, not a resource: shorter, a different color, and their
+  // position never changes (never carried, never delivered -- see sim.js),
+  // so we set it once here instead of every frame in render().
   const cubeMeshes = new Map(); // cubeId -> mesh
   for (const cube of sim.cubes.values()) {
+    if (cube.type === "ramp") {
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(CUBE_SIZE, RAMP_HEIGHT, CUBE_SIZE),
+        new THREE.MeshStandardMaterial({ color: 0x7a93a8 })
+      );
+      const c = cellCenter(cube.cx, cube.cz);
+      mesh.position.set(c.x, RAMP_REST_Y, c.z);
+      scene.add(mesh);
+      cubeMeshes.set(cube.id, mesh);
+      continue;
+    }
     const mesh = new THREE.Mesh(
       new THREE.BoxGeometry(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE),
       new THREE.MeshStandardMaterial({ color: 0xc48a5a })
@@ -151,6 +170,23 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   // any extra network messages). Keyed by playerId, tinted with that
   // player's color.
   const planVisuals = new Map();
+
+  // Brute-force scan is fine here -- there are only ever ~18 cubes, and this
+  // runs once per player per rendered frame.
+  function rampHeightAt(x, z) {
+    const { cx, cz } = worldToCell(x, z);
+    for (const cube of sim.cubes.values()) {
+      if (cube.type === "ramp" && cube.cx === cx && cube.cz === cz) return RAMP_HEIGHT;
+    }
+    return 0;
+  }
+
+  // Ramps are terrain, not something a player can pick up or deliver (see
+  // sim.js) -- exclude them from hover/select up front so players never get
+  // an "accepted" click on one that then silently does nothing.
+  function isGatherable(cubeId) {
+    return sim.cubes.get(cubeId)?.type !== "ramp" && currSnap.cubes[cubeId]?.carriedBy === null;
+  }
 
   function setHoveredCube(cubeId) {
     if (cubeId === hoveredCubeId) return;
@@ -305,8 +341,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     const hit = raycaster.intersectObjects([...cubeMeshes.values()])[0];
     if (hit) {
       const cubeId = [...cubeMeshes.entries()].find(([, m]) => m === hit.object)?.[0];
-      const grounded = cubeId && currSnap.cubes[cubeId]?.carriedBy === null;
-      setHoveredCube(grounded ? cubeId : null);
+      setHoveredCube(cubeId && isGatherable(cubeId) ? cubeId : null);
     } else {
       setHoveredCube(null);
     }
@@ -339,7 +374,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     const cubeHit = raycaster.intersectObjects([...cubeMeshes.values()])[0];
     if (cubeHit) {
       const cubeId = [...cubeMeshes.entries()].find(([, m]) => m === cubeHit.object)?.[0];
-      if (cubeId && currSnap.cubes[cubeId]?.carriedBy === null) {
+      if (cubeId && isGatherable(cubeId)) {
         selectedCubeId = cubeId;
         setHoveredCube(null);
         return;
@@ -456,7 +491,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       const x = a.x + (b.x - a.x) * alpha;
       const z = a.z + (b.z - a.z) * alpha;
       const facing = lerpAngle(a.facing, b.facing, alpha);
-      mesh.position.set(x, PLAYER_REST_Y, z);
+      mesh.position.set(x, PLAYER_REST_Y + rampHeightAt(x, z), z);
       mesh.rotation.y = facing;
 
       if (id === myId) {
@@ -467,11 +502,11 @@ export function startGame({ ws, players, myId, spawns, seed }) {
 
     for (const [id, mesh] of cubeMeshes) {
       const c = currSnap.cubes[id];
-      if (!c) continue;
+      if (!c || sim.cubes.get(id)?.type === "ramp") continue; // static, positioned once at creation
       if (c.carriedBy) {
         const carrierMesh = playerMeshes.get(c.carriedBy);
         if (carrierMesh) {
-          mesh.position.set(carrierMesh.position.x, CARRY_HEIGHT, carrierMesh.position.z);
+          mesh.position.set(carrierMesh.position.x, carrierMesh.position.y + CARRY_HEIGHT_OFFSET, carrierMesh.position.z);
         }
       } else {
         const worldX = (c.cx - GRID_SIZE / 2 + 0.5) * CELL_SIZE;

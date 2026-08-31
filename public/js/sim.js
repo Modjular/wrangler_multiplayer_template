@@ -15,6 +15,7 @@
 export const GRID_SIZE = 20;
 export const CELL_SIZE = 1;
 export const CUBE_COUNT = 18;
+export const RAMP_CHANCE = 0.25; // fraction of generated cubes that become ramps
 export const BASE_SPEED = 3.2; // units/sec
 export const ARRIVE_EPSILON = 0.05;
 
@@ -83,11 +84,6 @@ function inBounds(cx, cz) {
   return cx >= 0 && cx < GRID_SIZE && cz >= 0 && cz < GRID_SIZE;
 }
 
-// TODO(ramps): cubes are currently pure walls — isWalkable() always treats an
-// occupied cell as impassable. A future "ramp" cube type should be walkable
-// *on top of* (an elevated platform, not just an obstacle), which will need
-// its own case here and in the renderer. Deliberately out of scope for the
-// delivery-plan feature below.
 function cubeAtCell(sim, cx, cz) {
   for (const cube of sim.cubes.values()) {
     if (cube.carriedBy === null && cube.cx === cx && cube.cz === cz) return cube;
@@ -95,7 +91,20 @@ function cubeAtCell(sim, cx, cz) {
   return null;
 }
 
+// Two different notions of "occupied", now that ramps exist:
+//  - isWalkable: can a *player* stand/pass through this cell? Blocked by a
+//    "block" cube, but a "ramp" cube is a platform you walk up onto, so it
+//    doesn't block movement.
+//  - isCellFreeForCube: can a cube be *placed* in this cell (dropped, or
+//    delivered by a plan)? Any existing cube here — block or ramp — rules it
+//    out; we don't support stacking cubes on top of each other (yet).
 function isWalkable(sim, cx, cz) {
+  if (!inBounds(cx, cz)) return false;
+  const cube = cubeAtCell(sim, cx, cz);
+  return !cube || cube.type === "ramp";
+}
+
+function isCellFreeForCube(sim, cx, cz) {
   return inBounds(cx, cz) && !cubeAtCell(sim, cx, cz);
 }
 
@@ -116,8 +125,9 @@ function generateCubes(seed, excludeCells) {
     if (excluded.has(key)) continue;
     if ([...cubes.values()].some((c) => c.cx === cx && c.cz === cz)) continue;
     const weight = 1 + Math.floor(rng() * 3); // 1..3
+    const type = rng() < RAMP_CHANCE ? "ramp" : "block";
     const cubeId = `cube_${id++}`;
-    cubes.set(cubeId, { id: cubeId, cx, cz, weight, carriedBy: null });
+    cubes.set(cubeId, { id: cubeId, cx, cz, weight, type, carriedBy: null });
   }
   return cubes;
 }
@@ -274,7 +284,7 @@ export function applyCommand(sim, playerId, cmd) {
     }
     case "gather": {
       const cube = sim.cubes.get(cmd.cubeId);
-      if (!cube || cube.carriedBy !== null || player.carrying !== null) return;
+      if (!cube || cube.type === "ramp" || cube.carriedBy !== null || player.carrying !== null) return;
       const path = findAdjacentApproach(sim, player.x, player.z, cube.cx, cube.cz);
       player.order = path.length
         ? { type: "gather", cubeId: cmd.cubeId, path, pathIndex: 0 }
@@ -291,11 +301,11 @@ export function applyCommand(sim, playerId, cmd) {
     // is safe: it has no bearing on simulation state, just visibility.
     case "move_block": {
       const cube = sim.cubes.get(cmd.cubeId);
-      if (!cube || cube.carriedBy !== null || player.carrying !== null) return;
+      if (!cube || cube.type === "ramp" || cube.carriedBy !== null || player.carrying !== null) return;
       const { cx: destCx, cz: destCz } = worldToCell(cmd.x, cmd.z);
-      if (!isWalkable(sim, destCx, destCz)) {
+      if (!isCellFreeForCube(sim, destCx, destCz)) {
         console.warn(
-          `[sim] move_block: destination (${destCx},${destCz}) for cube ${cmd.cubeId} isn't walkable, plan rejected`
+          `[sim] move_block: destination (${destCx},${destCz}) for cube ${cmd.cubeId} isn't free, plan rejected`
         );
         return;
       }
@@ -324,7 +334,7 @@ export function applyCommand(sim, playerId, cmd) {
       const [dx, dz] = OCTANTS[octant];
       const targetCx = cx + dx;
       const targetCz = cz + dz;
-      if (!isWalkable(sim, targetCx, targetCz)) return;
+      if (!isCellFreeForCube(sim, targetCx, targetCz)) return;
       const cube = sim.cubes.get(player.carrying);
       cube.carriedBy = null;
       cube.cx = targetCx;
@@ -412,7 +422,7 @@ export function step(sim, dt) {
       }
 
       // phase === "to_dest"
-      if (!isWalkable(sim, destCx, destCz)) {
+      if (!isCellFreeForCube(sim, destCx, destCz)) {
         console.warn(
           `[sim] deliver: destination (${destCx},${destCz}) for cube ${cubeId} became blocked, plan abandoned (still carrying)`
         );
