@@ -256,6 +256,10 @@ export function createSimulation({ seed, players }) {
       facing: 0,
       carrying: null,
       order: { type: "idle" },
+      // FIFO of pending "deliver" jobs ({cubeId, destCx, destCz}) queued up
+      // while the player is busy with another order -- see applyCommand's
+      // "move_block" case and step()'s queue draining below.
+      queue: [],
     });
   }
 
@@ -381,6 +385,38 @@ function pathLength(fromX, fromZ, path) {
   return total;
 }
 
+// Attempts to actually start a "deliver" order for `job` ({cubeId, destCx,
+// destCz}) on a player who's currently idle -- shared by applyCommand's
+// "move_block" case (an immediate start, when the player isn't busy) and
+// step()'s queue draining (a deferred start, once whatever the player was
+// doing finishes). Re-validates everything at the moment it actually tries
+// to start, since a queued job's cube/destination may no longer be what it
+// was when the job was enqueued (another player could have grabbed the cube,
+// filled the destination, etc.). Returns whether it actually started;
+// logging + doing nothing on failure is enough for the immediate-command
+// case (matches the old behavior), and step() below decides what to do next
+// for a queued job that fails to start (drop it, try the next one).
+function tryStartDeliver(sim, player, job) {
+  const { cubeId, destCx, destCz } = job;
+  const cube = sim.cubes.get(cubeId);
+  if (!cube || cube.carriedBy !== null || player.carrying !== null) return false;
+  if (cube.level !== columnHeight(sim, cube.cx, cube.cz) - 1) return false;
+  if (!inBounds(destCx, destCz)) return false;
+  if (columnHeight(sim, destCx, destCz) >= MAX_STACK_HEIGHT) {
+    console.warn(
+      `[sim] move_block: destination (${destCx},${destCz}) for cube ${cubeId} is already at max stack height, plan rejected`
+    );
+    return false;
+  }
+  const path = findApproachAtHeight(sim, player.x, player.z, cube.cx, cube.cz, cube.level);
+  if (!path.length) {
+    console.warn(`[sim] move_block: player ${player.id} has no path to cube ${cubeId}, plan rejected`);
+    return false;
+  }
+  player.order = { type: "deliver", cubeId, destCx, destCz, phase: "to_cube", path, pathIndex: 0 };
+  return true;
+}
+
 export function applyCommand(sim, playerId, cmd) {
   const player = sim.players.get(playerId);
   if (!player) return;
@@ -389,6 +425,10 @@ export function applyCommand(sim, playerId, cmd) {
     case "move": {
       const path = findPath(sim, player.x, player.z, cmd.x, cmd.z);
       player.order = path.length ? { type: "move", path, pathIndex: 0 } : { type: "idle" };
+      // An explicit "walk here" is a direct interrupt, same as it's always
+      // overwritten whatever order was running -- also drop any queued
+      // delivery jobs rather than let them silently resume once idle.
+      player.queue.length = 0;
       break;
     }
     case "gather": {
@@ -401,6 +441,9 @@ export function applyCommand(sim, playerId, cmd) {
       player.order = path.length
         ? { type: "gather", cubeId: cmd.cubeId, path, pathIndex: 0 }
         : { type: "idle" };
+      // Direct manual control, same as "move"/"drop" -- don't leave queued
+      // delivery jobs to resume once this finishes.
+      player.queue.length = 0;
       break;
     }
     // A "plan" the player's avatar carries out on its own over two phases
@@ -411,34 +454,18 @@ export function applyCommand(sim, playerId, cmd) {
     // logged (see step() for details). This runs identically on every
     // client since it's part of the deterministic sim, so console.warn here
     // is safe: it has no bearing on simulation state, just visibility.
+    //
+    // If the player is busy with another order, this job is queued instead
+    // of dropped -- see tryStartDeliver above and step()'s queue draining
+    // below, which starts it once whatever's currently running finishes.
     case "move_block": {
-      const cube = sim.cubes.get(cmd.cubeId);
-      if (!cube || cube.carriedBy !== null || player.carrying !== null) return;
-      if (cube.level !== columnHeight(sim, cube.cx, cube.cz) - 1) return;
       const { cx: destCx, cz: destCz } = worldToCell(cmd.x, cmd.z);
-      if (!inBounds(destCx, destCz)) return;
-      if (columnHeight(sim, destCx, destCz) >= MAX_STACK_HEIGHT) {
-        console.warn(
-          `[sim] move_block: destination (${destCx},${destCz}) for cube ${cmd.cubeId} is already at max stack height, plan rejected`
-        );
-        return;
+      const job = { cubeId: cmd.cubeId, destCx, destCz };
+      if (player.order.type === "idle") {
+        tryStartDeliver(sim, player, job);
+      } else {
+        player.queue.push(job);
       }
-      const path = findApproachAtHeight(sim, player.x, player.z, cube.cx, cube.cz, cube.level);
-      if (!path.length) {
-        console.warn(
-          `[sim] move_block: player ${playerId} has no path to cube ${cmd.cubeId}, plan rejected`
-        );
-        return;
-      }
-      player.order = {
-        type: "deliver",
-        cubeId: cmd.cubeId,
-        destCx,
-        destCz,
-        phase: "to_cube",
-        path,
-        pathIndex: 0,
-      };
       break;
     }
     case "drop": {
@@ -457,6 +484,10 @@ export function applyCommand(sim, playerId, cmd) {
       cube.cz = targetCz;
       cube.level = targetHeight;
       player.carrying = null;
+      // A manual drop is the player taking direct control mid-plan -- don't
+      // let a queued job silently resume right after, same reasoning as
+      // "move" above.
+      player.queue.length = 0;
       break;
     }
     default:
@@ -497,82 +528,103 @@ export function advanceAlongPath(player, speed, dt) {
   return player.order.pathIndex >= player.order.path.length;
 }
 
-export function step(sim, dt) {
-  for (const player of sim.players.values()) {
-    const orderType = player.order.type;
-    if (orderType !== "move" && orderType !== "gather" && orderType !== "deliver") continue;
+// Advances a single player's current order by one tick -- pulled out of
+// step() below so its many early-exit points (order finishes, gets
+// abandoned, moves to the next phase) can just `return` instead of needing
+// step()'s loop-level `continue`, which would skip the queue-draining that
+// has to happen for every player, every tick, regardless of how their order
+// processing exited.
+function stepPlayerOrder(sim, player, dt) {
+  const orderType = player.order.type;
+  if (orderType !== "move" && orderType !== "gather" && orderType !== "deliver") return;
 
-    const carriedCube = player.carrying ? sim.cubes.get(player.carrying) : null;
-    const speed = carriedCube ? BASE_SPEED / (1 + 0.35 * carriedCube.weight) : BASE_SPEED;
-    const arrived = advanceAlongPath(player, speed, dt);
+  const carriedCube = player.carrying ? sim.cubes.get(player.carrying) : null;
+  const speed = carriedCube ? BASE_SPEED / (1 + 0.35 * carriedCube.weight) : BASE_SPEED;
+  const arrived = advanceAlongPath(player, speed, dt);
 
-    if (!arrived) continue;
+  if (!arrived) return;
 
-    if (orderType === "gather") {
-      const target = sim.cubes.get(player.order.cubeId);
-      const stillTopmost = target && target.level === columnHeight(sim, target.cx, target.cz) - 1;
-      if (target && target.carriedBy === null && stillTopmost) {
-        target.carriedBy = player.id;
-        player.carrying = target.id;
-      }
-      player.order = { type: "idle" };
-      continue;
+  if (orderType === "gather") {
+    const target = sim.cubes.get(player.order.cubeId);
+    const stillTopmost = target && target.level === columnHeight(sim, target.cx, target.cz) - 1;
+    if (target && target.carriedBy === null && stillTopmost) {
+      target.carriedBy = player.id;
+      player.carrying = target.id;
     }
+    player.order = { type: "idle" };
+    return;
+  }
 
-    if (orderType === "deliver") {
-      const { cubeId, destCx, destCz } = player.order;
+  if (orderType === "deliver") {
+    const { cubeId, destCx, destCz } = player.order;
 
-      if (player.order.phase === "to_cube") {
-        const target = sim.cubes.get(cubeId);
-        const stillTopmost = target && target.level === columnHeight(sim, target.cx, target.cz) - 1;
-        if (!target || target.carriedBy !== null || !stillTopmost) {
-          console.warn(`[sim] deliver: cube ${cubeId} is no longer available, plan abandoned`);
-          player.order = { type: "idle" };
-          continue;
-        }
-        target.carriedBy = player.id;
-        player.carrying = target.id;
-
-        const destHeight = columnHeight(sim, destCx, destCz);
-        if (destHeight >= MAX_STACK_HEIGHT) {
-          console.warn(
-            `[sim] deliver: destination (${destCx},${destCz}) for cube ${cubeId} is already at max stack height, plan abandoned (still carrying)`
-          );
-          player.order = { type: "idle" };
-          continue;
-        }
-        const path = findApproachAtHeight(sim, player.x, player.z, destCx, destCz, destHeight);
-        if (!path.length) {
-          console.warn(
-            `[sim] deliver: player ${player.id} has no path to destination (${destCx},${destCz}) for cube ${cubeId}, plan abandoned (still carrying)`
-          );
-          player.order = { type: "idle" };
-          continue;
-        }
-        player.order = { type: "deliver", cubeId, destCx, destCz, phase: "to_dest", path, pathIndex: 0 };
-        continue;
+    if (player.order.phase === "to_cube") {
+      const target = sim.cubes.get(cubeId);
+      const stillTopmost = target && target.level === columnHeight(sim, target.cx, target.cz) - 1;
+      if (!target || target.carriedBy !== null || !stillTopmost) {
+        console.warn(`[sim] deliver: cube ${cubeId} is no longer available, plan abandoned`);
+        player.order = { type: "idle" };
+        return;
       }
+      target.carriedBy = player.id;
+      player.carrying = target.id;
 
-      // phase === "to_dest"
       const destHeight = columnHeight(sim, destCx, destCz);
       if (destHeight >= MAX_STACK_HEIGHT) {
         console.warn(
-          `[sim] deliver: destination (${destCx},${destCz}) for cube ${cubeId} became full, plan abandoned (still carrying)`
+          `[sim] deliver: destination (${destCx},${destCz}) for cube ${cubeId} is already at max stack height, plan abandoned (still carrying)`
         );
         player.order = { type: "idle" };
-        continue;
+        return;
       }
-      const deliveredCube = sim.cubes.get(cubeId);
-      deliveredCube.carriedBy = null;
-      deliveredCube.cx = destCx;
-      deliveredCube.cz = destCz;
-      deliveredCube.level = destHeight;
-      player.carrying = null;
-      player.order = { type: "idle" };
-      continue;
+      const path = findApproachAtHeight(sim, player.x, player.z, destCx, destCz, destHeight);
+      if (!path.length) {
+        console.warn(
+          `[sim] deliver: player ${player.id} has no path to destination (${destCx},${destCz}) for cube ${cubeId}, plan abandoned (still carrying)`
+        );
+        player.order = { type: "idle" };
+        return;
+      }
+      player.order = { type: "deliver", cubeId, destCx, destCz, phase: "to_dest", path, pathIndex: 0 };
+      return;
     }
 
+    // phase === "to_dest"
+    const destHeight = columnHeight(sim, destCx, destCz);
+    if (destHeight >= MAX_STACK_HEIGHT) {
+      console.warn(
+        `[sim] deliver: destination (${destCx},${destCz}) for cube ${cubeId} became full, plan abandoned (still carrying)`
+      );
+      player.order = { type: "idle" };
+      return;
+    }
+    const deliveredCube = sim.cubes.get(cubeId);
+    deliveredCube.carriedBy = null;
+    deliveredCube.cx = destCx;
+    deliveredCube.cz = destCz;
+    deliveredCube.level = destHeight;
+    player.carrying = null;
     player.order = { type: "idle" };
+    return;
+  }
+
+  player.order = { type: "idle" };
+}
+
+export function step(sim, dt) {
+  for (const player of sim.players.values()) {
+    stepPlayerOrder(sim, player, dt);
+
+    // Whether the player just went idle this tick or already was idle
+    // (freshly spawned, or a previous drain attempt below failed), keep
+    // trying queued jobs front-to-back until one actually starts or the
+    // queue runs out -- a queued job can fail at start time (its cube got
+    // taken, its destination filled up) without that meaning the *next*
+    // queued job should be skipped too.
+    while (player.order.type === "idle" && player.queue.length > 0) {
+      const job = player.queue.shift();
+      if (tryStartDeliver(sim, player, job)) break;
+    }
   }
 
   sim.tick++;

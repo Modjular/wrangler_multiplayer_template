@@ -272,6 +272,24 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   // (waypoints are cell-centered anyway, so sub-cell motion can't change the
   // route), which in practice is at most a few times over a whole delivery.
   const planPathCache = new Map();
+  // playerId -> { cubeId, destCx, destCz, x, y, z } -- the frozen starting
+  // point of the current "to_dest" phase, captured once the instant a
+  // delivery flips from "to_cube" to "to_dest" (i.e. right when the avatar
+  // picks the cube up). Freezing both this and the route itself (order.path
+  // is read directly in updatePlanVisuals, not re-derived) is what makes the
+  // dashed line hold still -- "painted on the ground" -- instead of
+  // continuously creeping forward as the carrier walks, and keeps it
+  // exactly matching the real route instead of a fresh, possibly-different
+  // approximation re-derived from a moving position every frame.
+  const frozenDeliverOrigin = new Map();
+  // Extra, dimmer ghost boxes (no line) for each player's *queued* jobs --
+  // just enough feedback that a click while busy visibly registered as
+  // "queued" instead of silently vanishing. Keyed by playerId+index in the
+  // queue array; jobs only ever leave from the front, so a shift reuses the
+  // same key for a different job now and then -- a fine trade against a
+  // stable per-job id for how rarely a queue actually reshuffles.
+  const queueGhosts = new Map();
+  window.__queueGhosts = queueGhosts; // debug/test hook: inspect the queued-job ghost meshes
 
   // Brute-force scans are fine here -- there are only ever ~18 cubes, and
   // these run at most once per player/cube per rendered frame.
@@ -330,26 +348,66 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     const activeIds = new Set();
     for (const [id, player] of sim.players) {
       if (player.order.type !== "deliver") continue;
-      const { cubeId, destCx, destCz } = player.order;
+      const { cubeId, destCx, destCz, phase } = player.order;
       const cubeSnap = currSnap.cubes[cubeId];
       if (!cubeSnap) continue;
       activeIds.add(id);
 
       const dest = cellCenter(destCx, destCz);
       const ownHeight = realHeightOf(cubeSnap.type);
-      let originX, originZ, originY;
-      if (cubeSnap.carriedBy) {
-        const carrierMesh = playerMeshes.get(cubeSnap.carriedBy);
-        originX = carrierMesh ? carrierMesh.position.x : dest.x;
-        originZ = carrierMesh ? carrierMesh.position.z : dest.z;
-        originY = carrierMesh ? carrierMesh.position.y + CARRY_HEIGHT_OFFSET : ownHeight / 2;
+      const destY = columnTopY(dest.x, dest.z) + ownHeight / 2;
+
+      let originX, originZ, originY, waypoints;
+
+      if (phase === "to_dest") {
+        // Freeze the starting point the instant we first see this phase --
+        // together with order.path (read directly below, never re-derived)
+        // this stays fixed for the rest of the phase, so the line holds
+        // still instead of continuously creeping forward as the carrier
+        // walks, and always matches the real route (it *is* the real
+        // route -- see step()'s deliver handling).
+        let frozen = frozenDeliverOrigin.get(id);
+        if (!frozen || frozen.cubeId !== cubeId || frozen.destCx !== destCx || frozen.destCz !== destCz) {
+          const carrierMesh = playerMeshes.get(id);
+          frozen = {
+            cubeId,
+            destCx,
+            destCz,
+            x: carrierMesh ? carrierMesh.position.x : dest.x,
+            z: carrierMesh ? carrierMesh.position.z : dest.z,
+            y: carrierMesh ? carrierMesh.position.y + CARRY_HEIGHT_OFFSET : ownHeight / 2,
+          };
+          frozenDeliverOrigin.set(id, frozen);
+        }
+        originX = frozen.x;
+        originZ = frozen.z;
+        originY = frozen.y;
+        waypoints = player.order.path;
       } else {
+        // "to_cube": no authoritative destination route exists yet (that's
+        // only computed once the avatar actually picks the cube up -- see
+        // step()), so this is just a preview from the cube's own
+        // (currently stationary) resting spot -- already stable frame to
+        // frame on its own since the cube doesn't move until picked up.
+        frozenDeliverOrigin.delete(id); // clear a stale freeze from a past delivery
         const origin = cellCenter(cubeSnap.cx, cubeSnap.cz);
         originX = origin.x;
         originZ = origin.z;
         originY = cubeBaseY(cubeSnap) + ownHeight / 2;
+
+        // Still worth caching (see planPathCache above): re-selecting the
+        // same cube without moving would otherwise rerun this A* search
+        // every frame for no new information.
+        const originCell = worldToCell(originX, originZ);
+        const cacheKey = `${originCell.cx},${originCell.cz}->${destCx},${destCz}`;
+        const cached = planPathCache.get(id);
+        if (cached && cached.key === cacheKey) {
+          waypoints = cached.waypoints;
+        } else {
+          waypoints = findPath(sim, originX, originZ, dest.x, dest.z);
+          planPathCache.set(id, { key: cacheKey, waypoints });
+        }
       }
-      const destY = columnTopY(dest.x, dest.z) + ownHeight / 2;
 
       let visuals = planVisuals.get(id);
       if (!visuals) {
@@ -370,29 +428,19 @@ export function startGame({ ws, players, myId, spawns, seed }) {
 
       visuals.ghost.position.set(dest.x, destY, dest.z);
 
-      // Trace the actual route (re-derived purely for rendering -- same
-      // trick as myPrediction's local walk, never touches `sim`) instead of
-      // a straight line, so it visibly bends around obstacles and up/down
-      // ramps the way the real delivery will. Only rerun the A* search when
-      // the origin/dest cell actually changed since last frame (see
-      // planPathCache above) -- falls back to a straight line if the world
-      // changed out from under a *fresh* query (e.g. another player just
-      // blocked the route) -- there's nothing better to draw in that case.
-      const originCell = worldToCell(originX, originZ);
-      const cacheKey = `${originCell.cx},${originCell.cz}->${destCx},${destCz}`;
-      const cached = planPathCache.get(id);
-      let waypoints;
-      if (cached && cached.key === cacheKey) {
-        waypoints = cached.waypoints;
-      } else {
-        waypoints = findPath(sim, originX, originZ, dest.x, dest.z);
-        planPathCache.set(id, { key: cacheKey, waypoints });
-      }
+      // Trace the actual route: the "to_cube" preview via findPath already
+      // ends exactly at dest, but order.path for "to_dest" stops at the
+      // approach cell *next to* the destination (see findApproachAtHeight --
+      // the final "hop" onto/into the destination stack isn't a walked
+      // step), so append dest only when the route doesn't already end there.
       const points = [new THREE.Vector3(originX, originY, originZ)];
       for (const wp of waypoints) {
         points.push(new THREE.Vector3(wp.x, columnTopY(wp.x, wp.z) + ownHeight / 2, wp.z));
       }
-      if (!waypoints.length) points.push(new THREE.Vector3(dest.x, destY, dest.z));
+      const last = points[points.length - 1];
+      if (Math.hypot(last.x - dest.x, last.z - dest.z) > 1e-6) {
+        points.push(new THREE.Vector3(dest.x, destY, dest.z));
+      }
       visuals.line.geometry.setFromPoints(points);
       visuals.line.computeLineDistances();
     }
@@ -407,6 +455,57 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       visuals.line.material.dispose();
       planVisuals.delete(id);
       planPathCache.delete(id);
+      frozenDeliverOrigin.delete(id);
+    }
+
+    updateQueueGhosts();
+  }
+
+  // Renders one dim, line-less ghost box per *queued* job (see sim.js's
+  // player.queue) at its eventual destination -- purely a "yes, that click
+  // registered" acknowledgment, distinct from the brighter active-order
+  // ghost+line pair above.
+  function updateQueueGhosts() {
+    const activeKeys = new Set();
+    for (const [playerId, player] of sim.players) {
+      player.queue.forEach((job, index) => {
+        const cube = sim.cubes.get(job.cubeId);
+        if (!cube) return;
+        const key = `${playerId}:${index}`;
+        activeKeys.add(key);
+        const dest = cellCenter(job.destCx, job.destCz);
+        const ownHeight = realHeightOf(cube.type);
+        const destY = columnTopY(dest.x, dest.z) + ownHeight / 2;
+
+        let ghost = queueGhosts.get(key);
+        if (!ghost) {
+          const color = COLORS[colorIndexById.get(playerId) % COLORS.length];
+          ghost = new THREE.Mesh(
+            cubeGeometry(cube.type, cube.shape, ownHeight),
+            new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.16 })
+          );
+          ghost.userData.cubeId = job.cubeId;
+          scene.add(ghost);
+          queueGhosts.set(key, ghost);
+        } else if (ghost.userData.cubeId !== job.cubeId) {
+          // The front job left the queue and everything shifted down,
+          // reusing this playerId+index key for a *different* job -- rebuild
+          // the geometry instead of leaving it showing whatever shape the
+          // previous occupant of this slot was.
+          ghost.geometry.dispose();
+          ghost.geometry = cubeGeometry(cube.type, cube.shape, ownHeight);
+          ghost.userData.cubeId = job.cubeId;
+        }
+        ghost.position.set(dest.x, destY, dest.z);
+      });
+    }
+
+    for (const [key, ghost] of queueGhosts) {
+      if (activeKeys.has(key)) continue;
+      scene.remove(ghost);
+      ghost.geometry.dispose();
+      ghost.material.dispose();
+      queueGhosts.delete(key);
     }
   }
 
