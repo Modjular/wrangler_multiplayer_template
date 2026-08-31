@@ -20,6 +20,11 @@ export const MAX_STACK_HEIGHT = 4; // cap how tall a column of cubes can get
 export const BASE_SPEED = 3.2; // units/sec
 export const ARRIVE_EPSILON = 0.05;
 
+// Purely cosmetic mesh variants for "block" cubes -- see game.js. Doesn't
+// affect gameplay at all (walkability, stacking, carrying are all keyed off
+// `type`, never `shape`), it's just which geometry a block renders as.
+export const BLOCK_SHAPES = ["cube", "octagon", "cylinder"];
+
 const SQRT2 = Math.SQRT2;
 
 // 8 octants in the same winding as DIR_INDEX below, index i is the grid
@@ -153,8 +158,9 @@ function generateCubes(seed, excludeCells) {
     if ([...cubes.values()].some((c) => c.cx === cx && c.cz === cz)) continue;
     const weight = 1 + Math.floor(rng() * 3); // 1..3
     const type = rng() < RAMP_CHANCE ? "ramp" : "block";
+    const shape = type === "block" ? BLOCK_SHAPES[Math.floor(rng() * BLOCK_SHAPES.length)] : null;
     const cubeId = `cube_${id++}`;
-    cubes.set(cubeId, { id: cubeId, cx, cz, level: 0, weight, type, carriedBy: null });
+    cubes.set(cubeId, { id: cubeId, cx, cz, level: 0, weight, type, shape, carriedBy: null });
   }
   return cubes;
 }
@@ -496,7 +502,7 @@ export function snapshot(sim) {
   }
   const cubes = {};
   for (const [id, c] of sim.cubes) {
-    cubes[id] = { cx: c.cx, cz: c.cz, level: c.level, type: c.type, weight: c.weight, carriedBy: c.carriedBy };
+    cubes[id] = { cx: c.cx, cz: c.cz, level: c.level, type: c.type, shape: c.shape, weight: c.weight, carriedBy: c.carriedBy };
   }
   return { players, cubes };
 }

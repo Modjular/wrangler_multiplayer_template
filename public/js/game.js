@@ -29,6 +29,19 @@ function realHeightOf(cubeType) {
   return cubeType === "ramp" ? RAMP_HEIGHT : CUBE_SIZE;
 }
 
+// `shape` is purely cosmetic (see sim.js's BLOCK_SHAPES) -- every shape
+// still fills roughly the same footprint/height so stacking and carrying
+// look consistent regardless of which one a given block happens to be.
+// Ramps ignore shape entirely and are always a plain slab.
+function cubeGeometry(cubeType, shape, height) {
+  if (cubeType === "block") {
+    const radius = CUBE_SIZE / 2;
+    if (shape === "octagon") return new THREE.CylinderGeometry(radius, radius, height, 8);
+    if (shape === "cylinder") return new THREE.CylinderGeometry(radius, radius, height, 24);
+  }
+  return new THREE.BoxGeometry(CUBE_SIZE, height, CUBE_SIZE);
+}
+
 function shortestAngleDelta(from, to) {
   const twoPi = Math.PI * 2;
   const delta = (to - from) % twoPi;
@@ -122,7 +135,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   for (const cube of sim.cubes.values()) {
     const height = realHeightOf(cube.type);
     const mesh = new THREE.Mesh(
-      new THREE.BoxGeometry(CUBE_SIZE, height, CUBE_SIZE),
+      cubeGeometry(cube.type, cube.shape, height),
       new THREE.MeshStandardMaterial({ color: CUBE_COLOR })
     );
     scene.add(mesh);
@@ -249,7 +262,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       if (!visuals) {
         const color = COLORS[colorIndexById.get(id) % COLORS.length];
         const ghost = new THREE.Mesh(
-          new THREE.BoxGeometry(CUBE_SIZE, ownHeight, CUBE_SIZE),
+          cubeGeometry(cubeSnap.type, cubeSnap.shape, ownHeight),
           new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.35 })
         );
         const line = new THREE.Line(
@@ -401,10 +414,11 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     if (cubeHit) {
       const cubeId = [...cubeMeshes.entries()].find(([, m]) => m === cubeHit.object)?.[0];
       if (cubeId && isGatherable(cubeId)) {
+        const selectedCube = sim.cubes.get(cubeId);
         selectedCubeId = cubeId;
-        selectedCubeHeight = realHeightOf(sim.cubes.get(cubeId)?.type);
+        selectedCubeHeight = realHeightOf(selectedCube?.type);
         dragGhost.geometry.dispose();
-        dragGhost.geometry = new THREE.BoxGeometry(CUBE_SIZE, selectedCubeHeight, CUBE_SIZE);
+        dragGhost.geometry = cubeGeometry(selectedCube?.type, selectedCube?.shape, selectedCubeHeight);
         setHoveredCube(null);
         return;
       }
