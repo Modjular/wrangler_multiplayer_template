@@ -13,8 +13,7 @@ import {
 const COLORS = [0xff6b6b, 0x4ecdc4, 0xffe66d, 0x95e1d3, 0xa78bfa];
 
 const TICK_MS = 50; // 20Hz fixed simulation step, decoupled from render rate
-const MAX_FRAME_DELTA_MS = 250; // clamp a single rAF gap (e.g. tab refocus)
-const MAX_ACCUMULATOR_MS = 1000; // cap catch-up so a long stall doesn't freeze the tab
+const MAX_CATCHUP_MS = 100; // real time budget per frame for replaying missed ticks
 
 const PLAYER_RADIUS = 0.35;
 const PLAYER_LENGTH = 0.6;
@@ -404,11 +403,26 @@ export function startGame({ ws, players, myId, spawns, seed }) {
 
   function tick() {
     const now = Date.now();
-    const frameDelta = Math.min(now - lastFrameTime, MAX_FRAME_DELTA_MS);
+    const frameDelta = now - lastFrameTime;
     lastFrameTime = now;
-    accumulatorMs = Math.min(accumulatorMs + frameDelta, MAX_ACCUMULATOR_MS);
+    accumulatorMs += frameDelta;
 
-    while (accumulatorMs >= TICK_MS) {
+    // A long stall (backgrounded/throttled tab, laptop sleep, etc.) can leave
+    // a huge backlog of ticks to replay. Every one of them still has to run
+    // in order, with step() properly interleaved between whichever commands
+    // land on which tick — skipping ahead and draining several due commands
+    // in one shot (no step() between them) would replay this player's world
+    // differently than every other client replayed theirs, a silent desync
+    // (see CLAUDE.md). But step() itself is cheap (no pathfinding happens
+    // here — that's in applyCommand), so replaying even a large backlog is
+    // fine as long as we bound it by real processing time, not sim ticks:
+    // spend at most MAX_CATCHUP_MS of *wall-clock* time replaying ticks per
+    // frame, and let anything left over carry into the next rAF call, which
+    // fires again almost immediately since we're back in the foreground by
+    // then. This never drops or reorders a tick, just spreads a very large
+    // backlog across a few frames instead of one.
+    const catchUpStart = performance.now();
+    while (accumulatorMs >= TICK_MS && performance.now() - catchUpStart < MAX_CATCHUP_MS) {
       simClock += TICK_MS;
       applyDueCommands();
       prevSnap = currSnap;
@@ -417,7 +431,12 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       accumulatorMs -= TICK_MS;
     }
 
-    const alpha = accumulatorMs / TICK_MS;
+    // Normally < 1 (mid-tick leftover), but the catch-up loop above can exit
+    // early with a large backlog still queued (real-time budget hit, not yet
+    // caught up) -- clamp so we render at currSnap instead of extrapolating
+    // wildly past it; the rest of the backlog plays out over the next
+    // frame(s).
+    const alpha = Math.min(accumulatorMs / TICK_MS, 1);
     render(alpha);
 
     if (clickMarker.material.opacity > 0) {
