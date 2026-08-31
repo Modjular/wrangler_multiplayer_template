@@ -83,6 +83,11 @@ function inBounds(cx, cz) {
   return cx >= 0 && cx < GRID_SIZE && cz >= 0 && cz < GRID_SIZE;
 }
 
+// TODO(ramps): cubes are currently pure walls — isWalkable() always treats an
+// occupied cell as impassable. A future "ramp" cube type should be walkable
+// *on top of* (an elevated platform, not just an obstacle), which will need
+// its own case here and in the renderer. Deliberately out of scope for the
+// delivery-plan feature below.
 function cubeAtCell(sim, cx, cz) {
   for (const cube of sim.cubes.values()) {
     if (cube.carriedBy === null && cube.cx === cx && cube.cz === cz) return cube;
@@ -226,16 +231,20 @@ function findPath(sim, fromX, fromZ, toX, toZ) {
   return [];
 }
 
-function findGatherApproach(sim, player, cube) {
+// Finds the shortest path to a walkable cell adjacent to (targetCx, targetCz)
+// — used both to approach a cube for gathering and to approach a delivery
+// destination for dropping, since neither the cube itself nor (once dropped)
+// the destination cell is something a player can stand on.
+function findAdjacentApproach(sim, fromX, fromZ, targetCx, targetCz) {
   let best = null;
   for (const [dx, dz] of NEIGHBORS_4) {
-    const cx = cube.cx + dx;
-    const cz = cube.cz + dz;
+    const cx = targetCx + dx;
+    const cz = targetCz + dz;
     if (!isWalkable(sim, cx, cz)) continue;
     const center = cellCenter(cx, cz);
-    const path = findPath(sim, player.x, player.z, center.x, center.z);
-    if (!path.length && !(player.x === center.x && player.z === center.z)) continue;
-    const len = pathLength(player.x, player.z, path);
+    const path = findPath(sim, fromX, fromZ, center.x, center.z);
+    if (!path.length && !(fromX === center.x && fromZ === center.z)) continue;
+    const len = pathLength(fromX, fromZ, path);
     if (!best || len < best.len) best = { path, len };
   }
   return best ? best.path : [];
@@ -266,10 +275,46 @@ export function applyCommand(sim, playerId, cmd) {
     case "gather": {
       const cube = sim.cubes.get(cmd.cubeId);
       if (!cube || cube.carriedBy !== null || player.carrying !== null) return;
-      const path = findGatherApproach(sim, player, cube);
+      const path = findAdjacentApproach(sim, player.x, player.z, cube.cx, cube.cz);
       player.order = path.length
         ? { type: "gather", cubeId: cmd.cubeId, path, pathIndex: 0 }
         : { type: "idle" };
+      break;
+    }
+    // A "plan" the player's avatar carries out on its own over two phases
+    // (see `step()`): walk to the cube and pick it up, then walk to the
+    // destination and drop it there. Either phase can fail if the avatar
+    // can't find a path — e.g. it's boxed in by other cubes that need to be
+    // moved first — in which case the plan is abandoned and a warning is
+    // logged (see step() for details). This runs identically on every
+    // client since it's part of the deterministic sim, so console.warn here
+    // is safe: it has no bearing on simulation state, just visibility.
+    case "move_block": {
+      const cube = sim.cubes.get(cmd.cubeId);
+      if (!cube || cube.carriedBy !== null || player.carrying !== null) return;
+      const { cx: destCx, cz: destCz } = worldToCell(cmd.x, cmd.z);
+      if (!isWalkable(sim, destCx, destCz)) {
+        console.warn(
+          `[sim] move_block: destination (${destCx},${destCz}) for cube ${cmd.cubeId} isn't walkable, plan rejected`
+        );
+        return;
+      }
+      const path = findAdjacentApproach(sim, player.x, player.z, cube.cx, cube.cz);
+      if (!path.length) {
+        console.warn(
+          `[sim] move_block: player ${playerId} has no path to cube ${cmd.cubeId}, plan rejected`
+        );
+        return;
+      }
+      player.order = {
+        type: "deliver",
+        cubeId: cmd.cubeId,
+        destCx,
+        destCz,
+        phase: "to_cube",
+        path,
+        pathIndex: 0,
+      };
       break;
     }
     case "drop": {
@@ -322,21 +367,67 @@ function advanceAlongPath(player, speed, dt) {
 
 export function step(sim, dt) {
   for (const player of sim.players.values()) {
-    if (player.order.type !== "move" && player.order.type !== "gather") continue;
+    const orderType = player.order.type;
+    if (orderType !== "move" && orderType !== "gather" && orderType !== "deliver") continue;
 
-    const cube = player.carrying ? sim.cubes.get(player.carrying) : null;
-    const speed = cube ? BASE_SPEED / (1 + 0.35 * cube.weight) : BASE_SPEED;
+    const carriedCube = player.carrying ? sim.cubes.get(player.carrying) : null;
+    const speed = carriedCube ? BASE_SPEED / (1 + 0.35 * carriedCube.weight) : BASE_SPEED;
     const arrived = advanceAlongPath(player, speed, dt);
 
     if (!arrived) continue;
 
-    if (player.order.type === "gather") {
+    if (orderType === "gather") {
       const target = sim.cubes.get(player.order.cubeId);
       if (target && target.carriedBy === null) {
         target.carriedBy = player.id;
         player.carrying = target.id;
       }
+      player.order = { type: "idle" };
+      continue;
     }
+
+    if (orderType === "deliver") {
+      const { cubeId, destCx, destCz } = player.order;
+
+      if (player.order.phase === "to_cube") {
+        const target = sim.cubes.get(cubeId);
+        if (!target || target.carriedBy !== null) {
+          console.warn(`[sim] deliver: cube ${cubeId} is no longer available, plan abandoned`);
+          player.order = { type: "idle" };
+          continue;
+        }
+        target.carriedBy = player.id;
+        player.carrying = target.id;
+
+        const path = findAdjacentApproach(sim, player.x, player.z, destCx, destCz);
+        if (!path.length) {
+          console.warn(
+            `[sim] deliver: player ${player.id} has no path to destination (${destCx},${destCz}) for cube ${cubeId}, plan abandoned (still carrying)`
+          );
+          player.order = { type: "idle" };
+          continue;
+        }
+        player.order = { type: "deliver", cubeId, destCx, destCz, phase: "to_dest", path, pathIndex: 0 };
+        continue;
+      }
+
+      // phase === "to_dest"
+      if (!isWalkable(sim, destCx, destCz)) {
+        console.warn(
+          `[sim] deliver: destination (${destCx},${destCz}) for cube ${cubeId} became blocked, plan abandoned (still carrying)`
+        );
+        player.order = { type: "idle" };
+        continue;
+      }
+      const deliveredCube = sim.cubes.get(cubeId);
+      deliveredCube.carriedBy = null;
+      deliveredCube.cx = destCx;
+      deliveredCube.cz = destCz;
+      player.carrying = null;
+      player.order = { type: "idle" };
+      continue;
+    }
+
     player.order = { type: "idle" };
   }
 

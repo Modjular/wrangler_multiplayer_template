@@ -9,7 +9,7 @@ const IDLE_MS = 5 * 60 * 1000;
 // reaches execAt. See public/js/game.js for the client side of this.
 const INPUT_DELAY_MS = 200;
 
-const VALID_CMD_KINDS = new Set(["move", "gather", "drop"]);
+const VALID_CMD_KINDS = new Set(["move", "gather", "drop", "move_block"]);
 const MAP_BOUND = (GRID_SIZE * CELL_SIZE) / 2;
 
 function randomId() {
@@ -199,6 +199,12 @@ export class GameRoom {
     if (cmd.kind === "gather") {
       if (typeof cmd.cubeId !== "string" || cmd.cubeId.length > 32) return null;
       return { kind: "gather", cubeId: cmd.cubeId };
+    }
+    if (cmd.kind === "move_block") {
+      if (typeof cmd.cubeId !== "string" || cmd.cubeId.length > 32) return null;
+      if (!isFiniteNumber(cmd.x) || !isFiniteNumber(cmd.z)) return null;
+      if (Math.abs(cmd.x) > MAP_BOUND || Math.abs(cmd.z) > MAP_BOUND) return null;
+      return { kind: "move_block", cubeId: cmd.cubeId, x: cmd.x, z: cmd.z };
     }
     return { kind: "drop" };
   }
