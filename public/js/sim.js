@@ -195,7 +195,12 @@ export function createSimulation({ seed, players }) {
 // the cell itself is off-limits. Unlike before ramps existed, there's no
 // "nearest walkable cell" fallback: a click on a spot you can't climb to
 // just fails, the same way a boxed-in gather/delivery already does.
-function findPath(sim, fromX, fromZ, toX, toZ) {
+//
+// Exported (read-only, no side effects) so game.js can compute the same
+// path locally for instant-feedback client-side prediction of the local
+// player's own "move" commands, without waiting for the lockstep round
+// trip. See game.js's motion-prediction comment for the full picture.
+export function findPath(sim, fromX, fromZ, toX, toZ) {
   const start = worldToCell(fromX, fromZ);
   const goal = worldToCell(toX, toZ);
 
@@ -384,7 +389,12 @@ export function applyCommand(sim, playerId, cmd) {
   }
 }
 
-function advanceAlongPath(player, speed, dt) {
+// Exported so game.js can drive the exact same movement math for local
+// prediction (see findPath's export comment above) -- mutates `player.x`,
+// `.z`, `.facing`, and `.order.pathIndex` in place, same as it does for the
+// real sim; the caller can pass in a throwaway object shaped like a player
+// for a purely-local, never-networked prediction.
+export function advanceAlongPath(player, speed, dt) {
   let remaining = speed * dt;
   while (remaining > 0 && player.order.pathIndex < player.order.path.length) {
     const wp = player.order.path[player.order.pathIndex];
