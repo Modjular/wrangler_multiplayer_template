@@ -484,8 +484,17 @@ export function startGame({ ws, players, myId, spawns, seed }) {
             cubeGeometry(cube.type, cube.shape, ownHeight),
             new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.16 })
           );
+          ghost.userData.cubeId = job.cubeId;
           scene.add(ghost);
           queueGhosts.set(key, ghost);
+        } else if (ghost.userData.cubeId !== job.cubeId) {
+          // The front job left the queue and everything shifted down,
+          // reusing this playerId+index key for a *different* job -- rebuild
+          // the geometry instead of leaving it showing whatever shape the
+          // previous occupant of this slot was.
+          ghost.geometry.dispose();
+          ghost.geometry = cubeGeometry(cube.type, cube.shape, ownHeight);
+          ghost.userData.cubeId = job.cubeId;
         }
         ghost.position.set(dest.x, destY, dest.z);
       });

@@ -100,11 +100,12 @@ arrives, it's queued instead of dropped or interrupting the active order;
 helper, also used for an immediate start when idle) every tick a player
 goes idle, skipping — not getting stuck on — any queued job that's no
 longer valid by the time its turn comes up (its cube was taken, its
-destination filled up). An explicit `move` or `drop` command clears the
-queue, since those are the player taking direct manual control. A new
-queueable order kind needs the same three pieces: enqueue-when-busy in
-`applyCommand`, a `tryStart*`-style validator, and a drain call in
-`step()`.
+destination filled up). An explicit `move` / `gather` / `drop` command
+clears the queue, since those are the player taking direct manual control.
+A new queueable order kind needs the same three pieces: enqueue-when-busy
+in `applyCommand`, a `tryStart*`-style validator, and a drain call in
+`step()` — and every direct-control command needs to clear the queue too,
+or a queued job can silently resume once whatever direct order finishes.
 
 ## Local dev server
 

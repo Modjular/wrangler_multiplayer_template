@@ -441,6 +441,9 @@ export function applyCommand(sim, playerId, cmd) {
       player.order = path.length
         ? { type: "gather", cubeId: cmd.cubeId, path, pathIndex: 0 }
         : { type: "idle" };
+      // Direct manual control, same as "move"/"drop" -- don't leave queued
+      // delivery jobs to resume once this finishes.
+      player.queue.length = 0;
       break;
     }
     // A "plan" the player's avatar carries out on its own over two phases
