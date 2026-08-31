@@ -13,7 +13,6 @@ import {
 const COLORS = [0xff6b6b, 0x4ecdc4, 0xffe66d, 0x95e1d3, 0xa78bfa];
 
 const TICK_MS = 50; // 20Hz fixed simulation step, decoupled from render rate
-const MAX_FRAME_DELTA_MS = 250; // clamp a single rAF gap (e.g. tab refocus)
 const MAX_ACCUMULATOR_MS = 1000; // cap catch-up so a long stall doesn't freeze the tab
 
 const PLAYER_RADIUS = 0.35;
@@ -404,9 +403,27 @@ export function startGame({ ws, players, myId, spawns, seed }) {
 
   function tick() {
     const now = Date.now();
-    const frameDelta = Math.min(now - lastFrameTime, MAX_FRAME_DELTA_MS);
+    const frameDelta = now - lastFrameTime;
     lastFrameTime = now;
-    accumulatorMs = Math.min(accumulatorMs + frameDelta, MAX_ACCUMULATOR_MS);
+    accumulatorMs += frameDelta;
+
+    // A long stall (backgrounded/throttled tab, laptop sleep, etc.) can leave
+    // a huge amount of real time to catch up on. Actually *simulating* every
+    // one of those ticks would freeze the tab, but simClock must still track
+    // real time exactly — it's what decides whether a relayed command counts
+    // as due (see applyDueCommands above), and every client's execAt is an
+    // absolute wall-clock timestamp. So: simulate at most MAX_ACCUMULATOR_MS
+    // worth of ticks, but fast-forward simClock through anything beyond that
+    // without stepping it. This used to clamp the per-frame delta instead,
+    // which silently discarded real elapsed time on a throttled tab —
+    // simClock permanently fell behind wall-clock time the whole time that
+    // tab stayed backgrounded, so its owner saw other players' commands
+    // "trickle in" later and later, and the two sims genuinely diverged
+    // rather than just rendering late.
+    if (accumulatorMs > MAX_ACCUMULATOR_MS) {
+      simClock += accumulatorMs - MAX_ACCUMULATOR_MS;
+      accumulatorMs = MAX_ACCUMULATOR_MS;
+    }
 
     while (accumulatorMs >= TICK_MS) {
       simClock += TICK_MS;
