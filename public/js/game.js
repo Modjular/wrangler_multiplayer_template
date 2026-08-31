@@ -13,7 +13,7 @@ import {
 const COLORS = [0xff6b6b, 0x4ecdc4, 0xffe66d, 0x95e1d3, 0xa78bfa];
 
 const TICK_MS = 50; // 20Hz fixed simulation step, decoupled from render rate
-const MAX_ACCUMULATOR_MS = 1000; // cap catch-up so a long stall doesn't freeze the tab
+const MAX_CATCHUP_MS = 100; // real time budget per frame for replaying missed ticks
 
 const PLAYER_RADIUS = 0.35;
 const PLAYER_LENGTH = 0.6;
@@ -408,24 +408,21 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     accumulatorMs += frameDelta;
 
     // A long stall (backgrounded/throttled tab, laptop sleep, etc.) can leave
-    // a huge amount of real time to catch up on. Actually *simulating* every
-    // one of those ticks would freeze the tab, but simClock must still track
-    // real time exactly — it's what decides whether a relayed command counts
-    // as due (see applyDueCommands above), and every client's execAt is an
-    // absolute wall-clock timestamp. So: simulate at most MAX_ACCUMULATOR_MS
-    // worth of ticks, but fast-forward simClock through anything beyond that
-    // without stepping it. This used to clamp the per-frame delta instead,
-    // which silently discarded real elapsed time on a throttled tab —
-    // simClock permanently fell behind wall-clock time the whole time that
-    // tab stayed backgrounded, so its owner saw other players' commands
-    // "trickle in" later and later, and the two sims genuinely diverged
-    // rather than just rendering late.
-    if (accumulatorMs > MAX_ACCUMULATOR_MS) {
-      simClock += accumulatorMs - MAX_ACCUMULATOR_MS;
-      accumulatorMs = MAX_ACCUMULATOR_MS;
-    }
-
-    while (accumulatorMs >= TICK_MS) {
+    // a huge backlog of ticks to replay. Every one of them still has to run
+    // in order, with step() properly interleaved between whichever commands
+    // land on which tick — skipping ahead and draining several due commands
+    // in one shot (no step() between them) would replay this player's world
+    // differently than every other client replayed theirs, a silent desync
+    // (see CLAUDE.md). But step() itself is cheap (no pathfinding happens
+    // here — that's in applyCommand), so replaying even a large backlog is
+    // fine as long as we bound it by real processing time, not sim ticks:
+    // spend at most MAX_CATCHUP_MS of *wall-clock* time replaying ticks per
+    // frame, and let anything left over carry into the next rAF call, which
+    // fires again almost immediately since we're back in the foreground by
+    // then. This never drops or reorders a tick, just spreads a very large
+    // backlog across a few frames instead of one.
+    const catchUpStart = performance.now();
+    while (accumulatorMs >= TICK_MS && performance.now() - catchUpStart < MAX_CATCHUP_MS) {
       simClock += TICK_MS;
       applyDueCommands();
       prevSnap = currSnap;
@@ -434,7 +431,12 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       accumulatorMs -= TICK_MS;
     }
 
-    const alpha = accumulatorMs / TICK_MS;
+    // Normally < 1 (mid-tick leftover), but the catch-up loop above can exit
+    // early with a large backlog still queued (real-time budget hit, not yet
+    // caught up) -- clamp so we render at currSnap instead of extrapolating
+    // wildly past it; the rest of the backlog plays out over the next
+    // frame(s).
+    const alpha = Math.min(accumulatorMs / TICK_MS, 1);
     render(alpha);
 
     if (clickMarker.material.opacity > 0) {
