@@ -263,7 +263,10 @@ export function createSimulation({ seed, players }) {
     });
   }
 
-  return { gridSize: GRID_SIZE, cellSize: CELL_SIZE, cubes, players: playerMap, tick: 0 };
+  // `seed` is kept on the sim object purely as debug metadata (see
+  // serializeState below) -- nothing here re-derives the cube layout from
+  // it after generateCubes runs once above.
+  return { gridSize: GRID_SIZE, cellSize: CELL_SIZE, cubes, players: playerMap, tick: 0, seed };
 }
 
 // 8-directional A* over the grid. Returns a list of world-space waypoints
@@ -642,4 +645,43 @@ export function snapshot(sim) {
     cubes[id] = { cx: c.cx, cz: c.cz, level: c.level, type: c.type, shape: c.shape, weight: c.weight, carriedBy: c.carriedBy };
   }
   return { players, cubes };
+}
+
+// Full, JSON-safe dump of *everything* needed to exactly reconstruct a
+// working `sim` object -- unlike snapshot() above (which is lossy on
+// purpose: it drops fields like `order`/`queue` that render-time
+// interpolation never needs), this is meant for offline debugging. Exported
+// for game.js's debug-export tooling (see the F9 shortcut / window.__exportState
+// in game.js) and scripts/debug-state.mjs: hit a "why can't I place this"
+// bug live, dump the state to a file, then replay it offline against
+// sim.js's own pathing functions (findPath, canStep, hasReachableApproach,
+// etc.) instead of hand-building a synthetic repro from scratch every time.
+export function serializeState(sim) {
+  return {
+    version: 1,
+    gridSize: sim.gridSize,
+    cellSize: sim.cellSize,
+    tick: sim.tick,
+    seed: sim.seed,
+    cubes: [...sim.cubes.values()],
+    players: [...sim.players.values()],
+  };
+}
+
+// Inverse of serializeState -- rebuilds a `sim` object (real Maps, not the
+// plain arrays JSON round-trips as) ready to pass straight into findPath,
+// canStep, hasReachableApproach, applyCommand, step(), etc.
+export function deserializeState(data) {
+  const cubes = new Map(data.cubes.map((c) => [c.id, { ...c }]));
+  const players = new Map(
+    data.players.map((p) => [p.id, { ...p, order: p.order ?? { type: "idle" }, queue: [...(p.queue ?? [])] }])
+  );
+  return {
+    gridSize: data.gridSize,
+    cellSize: data.cellSize,
+    tick: data.tick,
+    seed: data.seed,
+    cubes,
+    players,
+  };
 }

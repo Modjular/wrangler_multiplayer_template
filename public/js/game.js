@@ -16,6 +16,7 @@ import {
   reachableColumnsFromApproach,
   hasReachableApproach,
   MAX_STACK_HEIGHT,
+  serializeState,
 } from "./sim.js";
 
 const COLORS = [0xff6b6b, 0x4ecdc4, 0xffe66d, 0x95e1d3, 0xa78bfa];
@@ -101,6 +102,21 @@ function lerpAngle(from, to, t) {
   return from + shortestAngleDelta(from, to) * t;
 }
 
+// Triggers a browser file download for arbitrary JSON data -- used by the
+// F9 debug-state export below. Plain Blob + throwaway <a download>, no
+// library needed.
+function downloadJSON(filename, data) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 export function startGame({ ws, players, myId, spawns, seed }) {
   const canvas = document.getElementById("game-canvas");
 
@@ -113,6 +129,10 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   const sim = createSimulation({ seed, players: simPlayers });
   window.__sim = sim; // debug/test hook: inspect live sim state from devtools
   window.__ws = ws; // debug/test hook: send raw commands from devtools
+  // debug hook: full JSON-safe state dump (see serializeState in sim.js) --
+  // e.g. `copy(__exportState())` in devtools to grab it without needing the
+  // F9 file-download shortcut below. Also feeds scripts/debug-state.mjs.
+  window.__exportState = () => serializeState(sim);
 
   // ---- scene ------------------------------------------------------------
   const scene = new THREE.Scene();
@@ -855,6 +875,16 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       myPrediction = null; // dropping isn't predicted; don't leave a stale move running
     } else if (e.code === "Escape" && selectedCubeId !== null) {
       cancelSelection();
+    } else if (e.code === "F9") {
+      // Debug tooling: dump the full sim state as a downloadable JSON file
+      // any time something looks wrong (a block that "should" be
+      // placeable, a stuck delivery, etc.) -- see serializeState in sim.js
+      // and scripts/debug-state.mjs for offline diagnosis against the
+      // exact map that triggered it.
+      e.preventDefault();
+      const state = serializeState(sim);
+      downloadJSON(`multiplayer-state-${Date.now()}.json`, state);
+      console.log("[debug] exported sim state (see downloaded file):", state);
     }
   });
 

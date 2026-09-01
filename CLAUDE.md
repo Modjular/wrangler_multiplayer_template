@@ -107,6 +107,32 @@ in `applyCommand`, a `tryStart*`-style validator, and a drain call in
 `step()` — and every direct-control command needs to clear the queue too,
 or a queued job can silently resume once whatever direct order finishes.
 
+## Debugging a live map: export + offline diagnosis
+
+The map is procedurally generated and can be sparse enough to hit a
+genuinely-unreachable layout, so there's a way to capture the *exact* state
+that triggered a bug and pick it apart offline instead of re-describing it
+from memory:
+
+- **Export**: press **F9** in the running game to download the full sim
+  state as `multiplayer-state-<timestamp>.json` (also logs it to the
+  console). From devtools, `copy(__exportState())` grabs it without a file
+  download. Both call `serializeState(sim)` (`sim.js`) — a full, JSON-safe
+  dump of cubes/players/queues/orders, *not* the lossy `snapshot()` used for
+  render interpolation (which drops fields like `order`/`queue` on purpose).
+- **Offline diagnosis**: `node scripts/debug-state.mjs <file.json>` prints
+  a summary (players, column stacks). `... deliver <player> <cube> <destCx>
+  <destCz>` replays `tryStartDeliver`'s checks step by step against the
+  real map and reports exactly which one fails and why — including the
+  "reachable to fetch, but the destination is unreachable" case that's
+  otherwise silently abandoned mid-carry (a `console.warn` in `step()`,
+  easy to miss just by playing). `... reach <player>` lists every column
+  currently reachable from that player. All three commands run `sim.js`'s
+  own `reachableColumns`/`approachCells`/`hasReachableApproach` — the same
+  functions game.js's own reachability hint uses — via
+  `deserializeState(json)`, which rebuilds a real, working `sim` object
+  from the dump.
+
 ## Local dev server
 
 The user often already has `npm run dev` (`wrangler dev`, port 8787) running
