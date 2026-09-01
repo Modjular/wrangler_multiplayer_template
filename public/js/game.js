@@ -137,7 +137,12 @@ export function startGame({ ws, players, myId, spawns, seed }) {
 
   // ---- scene ------------------------------------------------------------
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x1a1c26);
+  const BG_COLOR = 0x1a1c26;
+  scene.background = new THREE.Color(BG_COLOR);
+  // Fades geometry to the background color with distance -- there's nothing
+  // beyond the ground plane's edge, so this mostly just softens that edge
+  // instead of showing a hard color seam where the plane stops.
+  scene.fog = new THREE.Fog(BG_COLOR, 12, 32);
 
   const mapExtent = (GRID_SIZE * CELL_SIZE) / 2;
   const camera = new THREE.PerspectiveCamera(
@@ -169,13 +174,37 @@ export function startGame({ ws, players, myId, spawns, seed }) {
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(window.devicePixelRatio);
+  // Filmic tone mapping alone makes the existing PBR (MeshStandardMaterial)
+  // lighting below read as considerably richer/less washed-out -- a render
+  // setting, not more scene complexity.
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.1;
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   // We handle all touch gestures ourselves (drag-to-place, drag-to-pan) --
   // tell the browser not to also try to scroll/zoom/select on the canvas.
   canvas.style.touchAction = "none";
 
-  scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-  const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+  // Hemisphere (sky/ground bounce) light instead of flat ambient, plus a
+  // warm-tinted sun -- same light count and cost as before, just less
+  // uniformly flat. The sun casts the only shadows in the scene; the map is
+  // small (one ~20x20 grid, a couple dozen meshes) so a modest, tightly-fit
+  // shadow camera is cheap here.
+  scene.add(new THREE.HemisphereLight(0x8fa8c7, 0x30281f, 0.7));
+  const dirLight = new THREE.DirectionalLight(0xfff1d8, 1.1);
   dirLight.position.set(5, 10, 5);
+  dirLight.castShadow = true;
+  dirLight.shadow.mapSize.set(1024, 1024);
+  dirLight.shadow.bias = -0.0015;
+  const shadowExtent = mapExtent * 1.1;
+  Object.assign(dirLight.shadow.camera, {
+    left: -shadowExtent,
+    right: shadowExtent,
+    top: shadowExtent,
+    bottom: -shadowExtent,
+    near: 1,
+    far: 30,
+  });
   scene.add(dirLight);
 
   const ground = new THREE.Mesh(
@@ -183,6 +212,7 @@ export function startGame({ ws, players, myId, spawns, seed }) {
     new THREE.MeshStandardMaterial({ color: 0x2a2d3a })
   );
   ground.rotation.x = -Math.PI / 2;
+  ground.receiveShadow = true;
   scene.add(ground);
 
   const gridHelper = new THREE.GridHelper(GRID_SIZE * CELL_SIZE, GRID_SIZE, 0x44485a, 0x333644);
@@ -199,6 +229,8 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       color: COLORS[colorIndexById.get(p.id) % COLORS.length],
     });
     const mesh = new THREE.Mesh(geometry, material);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
     const s = sim.players.get(p.id);
     mesh.position.set(s.x, PLAYER_REST_Y, s.z);
     scene.add(mesh);
@@ -228,6 +260,8 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       cubeGeometry(cube.type, cube.shape, height),
       new THREE.MeshStandardMaterial({ color: CUBE_COLOR })
     );
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
     scene.add(mesh);
     cubeMeshes.set(cube.id, mesh);
   }
