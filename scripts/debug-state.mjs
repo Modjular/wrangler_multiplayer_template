@@ -23,6 +23,7 @@ import {
   reachableColumns,
   reachableColumnsFromApproach,
   hasReachableApproach,
+  withCubeVirtuallyRemoved,
   worldToCell,
   MAX_STACK_HEIGHT,
 } from "../public/js/sim.js";
@@ -94,12 +95,15 @@ function summary() {
 // up -- a delivery can pass every up-front check and still get silently
 // abandoned later (see step()'s "phase === 'to_cube'" handling and its
 // console.warn), which is the easiest failure mode to miss just by playing.
+// Caller (the "deliver" case below) is responsible for checking that
+// playerId/cubeId actually exist first, same as the "reach" case does for
+// its own playerId -- keeps both subcommands' error handling consistent
+// (console.error + exit 1) instead of this one printing its own error via
+// console.log and exiting 0 as if the diagnosis had succeeded.
 function diagnoseDeliver(playerId, cubeId, destCx, destCz) {
   const lines = [];
   const player = sim.players.get(playerId);
-  if (!player) return [`no such player "${playerId}" -- known players: ${[...sim.players.keys()].join(", ")}`];
   const cube = sim.cubes.get(cubeId);
-  if (!cube) return [`no such cube "${cubeId}"`];
 
   lines.push(
     `cube ${cubeId}: type=${cube.type} shape=${cube.shape ?? "n/a"} at ${fmtCell(cube.cx, cube.cz)} level=${cube.level} weight=${cube.weight} carriedBy=${cube.carriedBy ?? "-"}`
@@ -155,13 +159,20 @@ function diagnoseDeliver(playerId, cubeId, destCx, destCz) {
 
   // Phase 2: once picked up, can the player reach an approach cell for the
   // destination? Seeded from the cube's own approach cells, not its column
-  // (see reachableColumnsFromApproach's doc comment).
+  // (see reachableColumnsFromApproach's doc comment). Both the destination's
+  // own approach-cell lookup and the reachability check have to run with
+  // the cube virtually removed from its own column too (see
+  // withCubeVirtuallyRemoved's doc comment) -- otherwise a destination
+  // whose only approach is exactly this cube's own column would misreport
+  // as unreachable even though the real delivery would succeed.
   const reachFromCube = reachableColumnsFromApproach(sim, cube.cx, cube.cz, cube.level);
-  const destApproaches = approachCells(sim, destCx, destCz, destHeight);
+  const { destApproaches, canDeliver } = withCubeVirtuallyRemoved(sim, cube.cx, cube.cz, () => ({
+    destApproaches: approachCells(sim, destCx, destCz, destHeight),
+    canDeliver: hasReachableApproach(sim, reachFromCube, destCx, destCz, destHeight),
+  }));
   lines.push(
     `destination's approach cells (height ${destHeight}): ${destApproaches.length ? destApproaches.map((c) => fmtCell(c.cx, c.cz)).join(", ") : "NONE"}`
   );
-  const canDeliver = hasReachableApproach(sim, reachFromCube, destCx, destCz, destHeight);
   lines.push(`reachable from the cube's location once picked up: ${canDeliver ? "yes" : "NO"}`);
   if (!canDeliver) {
     lines.push(
@@ -186,6 +197,14 @@ switch (command ?? "summary") {
     const [playerId, cubeId, cxStr, czStr] = args;
     if (!playerId || !cubeId || cxStr === undefined || czStr === undefined) {
       console.error(`usage: deliver <playerId> <cubeId> <destCx> <destCz>\n\n${usage()}`);
+      process.exit(1);
+    }
+    if (!sim.players.has(playerId)) {
+      console.error(`no such player "${playerId}" -- known players: ${[...sim.players.keys()].join(", ")}`);
+      process.exit(1);
+    }
+    if (!sim.cubes.has(cubeId)) {
+      console.error(`no such cube "${cubeId}"`);
       process.exit(1);
     }
     for (const line of diagnoseDeliver(playerId, cubeId, Number(cxStr), Number(czStr))) console.log(line);

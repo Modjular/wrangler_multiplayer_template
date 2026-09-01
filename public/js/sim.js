@@ -194,14 +194,47 @@ export function reachableColumns(sim, fromX, fromZ) {
   return floodFillColumns(sim, [start]);
 }
 
+// Runs `fn()` with the topmost cube at (originCx, originCz) temporarily
+// excluded from columnHeight/canStep calculations (its `carriedBy` set to a
+// sentinel value, always restored afterward, even if `fn` throws) --
+// simulates the moment step()'s deliver handling actually removes a cube
+// from its own column (one level shorter) *before* computing the route to
+// the destination (see step()'s "phase === 'to_cube'" handling, which sets
+// `target.carriedBy` before calling findApproachAtHeight for the
+// destination). Exported so a caller checking a *specific* destination
+// against an already-computed reachableColumnsFromApproach set (via
+// hasReachableApproach) can wrap that check the same way -- otherwise
+// hasReachableApproach's own internal approachCells lookup re-reads the
+// cube's *actual* (not-yet-removed) column height, and a destination whose
+// only approach is exactly this cube's own column reads as unreachable
+// even though the real delivery would succeed (reproduced directly: a lone
+// cube at (5,5), destination (5,6) walled in on every side except (5,5) --
+// unreachable by the old code even though applyCommand+step delivered it
+// fine for real). See game.js's updateDragGhostAt and
+// scripts/debug-state.mjs's diagnoseDeliver for the two call sites.
+export function withCubeVirtuallyRemoved(sim, originCx, originCz, fn) {
+  const cube = topCubeAt(sim, originCx, originCz);
+  if (!cube) return fn();
+  const wasCarriedBy = cube.carriedBy;
+  cube.carriedBy = "__pickup_simulation__";
+  try {
+    return fn();
+  } finally {
+    cube.carriedBy = wasCarriedBy;
+  }
+}
+
 // Same flood fill, but seeded from every valid approach cell around
 // (targetCx, targetCz) at `requiredHeight` (see approachCells) instead of a
 // single point -- for "everywhere reachable once I'm standing next to
 // <cube>", where the cube's own column is *not* a valid stand-on point (it's
 // usually one level taller than the approach height) and there can be more
-// than one legal side to approach from.
+// than one legal side to approach from. See withCubeVirtuallyRemoved above
+// for why the cube itself has to be excluded from the flood fill's height
+// calculations while this runs.
 export function reachableColumnsFromApproach(sim, targetCx, targetCz, requiredHeight) {
-  return floodFillColumns(sim, approachCells(sim, targetCx, targetCz, requiredHeight));
+  const approach = approachCells(sim, targetCx, targetCz, requiredHeight);
+  return withCubeVirtuallyRemoved(sim, targetCx, targetCz, () => floodFillColumns(sim, approach));
 }
 
 // Given a set of columns reachable from wherever the player will actually be
@@ -402,9 +435,20 @@ function pathLength(fromX, fromZ, path) {
 function tryStartDeliver(sim, player, job) {
   const { cubeId, destCx, destCz } = job;
   const cube = sim.cubes.get(cubeId);
-  if (!cube || cube.carriedBy !== null || player.carrying !== null) return false;
-  if (cube.level !== columnHeight(sim, cube.cx, cube.cz) - 1) return false;
-  if (!inBounds(destCx, destCz)) return false;
+  if (!cube || cube.carriedBy !== null || player.carrying !== null) {
+    console.warn(
+      `[sim] move_block: player ${player.id} can't start delivering ${cubeId} right now (cube missing/already carried, or player already carrying something), plan rejected`
+    );
+    return false;
+  }
+  if (cube.level !== columnHeight(sim, cube.cx, cube.cz) - 1) {
+    console.warn(`[sim] move_block: cube ${cubeId} is no longer the topmost cube in its column, plan rejected`);
+    return false;
+  }
+  if (!inBounds(destCx, destCz)) {
+    console.warn(`[sim] move_block: destination (${destCx},${destCz}) for cube ${cubeId} is out of bounds, plan rejected`);
+    return false;
+  }
   if (columnHeight(sim, destCx, destCz) >= MAX_STACK_HEIGHT) {
     console.warn(
       `[sim] move_block: destination (${destCx},${destCz}) for cube ${cubeId} is already at max stack height, plan rejected`

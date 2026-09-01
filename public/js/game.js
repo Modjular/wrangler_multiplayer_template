@@ -15,6 +15,7 @@ import {
   reachableColumns,
   reachableColumnsFromApproach,
   hasReachableApproach,
+  withCubeVirtuallyRemoved,
   MAX_STACK_HEIGHT,
   serializeState,
 } from "./sim.js";
@@ -703,10 +704,21 @@ export function startGame({ ws, players, myId, spawns, seed }) {
       // stand next to. Just a hint -- commit is still allowed either way,
       // in case the world changes (or I move) between now and clicking.
       const destHeight = columnHeight(sim, cx, cz);
+      // hasReachableApproach re-derives the destination's own approach-cell
+      // heights fresh -- if the selected cube's own column happens to be
+      // one of those neighbors, this needs to see it as already picked up
+      // (one level shorter), the same simulation
+      // reachableColumnsFromApproach used to build selectedCubeReachableFromPickup
+      // in the first place, or this can wrongly read as unreachable (see
+      // withCubeVirtuallyRemoved's doc comment in sim.js).
+      const selectedCube = sim.cubes.get(selectedCubeId);
       const deliverable =
         selectedCubeFetchable &&
         destHeight < MAX_STACK_HEIGHT &&
-        hasReachableApproach(sim, selectedCubeReachableFromPickup, cx, cz, destHeight);
+        !!selectedCube &&
+        withCubeVirtuallyRemoved(sim, selectedCube.cx, selectedCube.cz, () =>
+          hasReachableApproach(sim, selectedCubeReachableFromPickup, cx, cz, destHeight)
+        );
       dragGhost.material.color.setHex(deliverable ? COLORS[myColorIndex % COLORS.length] : INVALID_GHOST_COLOR);
     }
   }

@@ -131,7 +131,8 @@ from memory:
   own `reachableColumns`/`approachCells`/`hasReachableApproach` — the same
   functions game.js's own reachability hint uses — via
   `deserializeState(json)`, which rebuilds a real, working `sim` object
-  from the dump.
+  from the dump (`deliver`/`reach` actually call those reachability
+  functions; plain `summary` just prints the raw player/cube state).
 
 ## Local dev server
 
