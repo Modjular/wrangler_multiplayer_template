@@ -134,6 +134,24 @@ from memory:
   from the dump (`deliver`/`reach` actually call those reachability
   functions; plain `summary` just prints the raw player/cube state).
 
+## Rendering polish (`game.js`)
+
+The scene-setup block in `startGame` (tone mapping, hemisphere light,
+directional shadows, fog) is deliberately kept small and localized —
+resist the urge to grow it into a post-processing pipeline
+(`EffectComposer`, bloom, etc.) or split it into its own module unless a
+feature actually needs that. It's ~30 lines of THREE.js boilerplate, not an
+abstraction layer.
+
+**Headless/sandboxed testing caveat:** this dev sandbox's Playwright
+Chromium has no real GPU — `WEBGL_debug_renderer_info` reports SwiftShader
+(software rendering). Any extra render pass, especially shadow mapping, is
+disproportionately expensive here compared to real hardware. Don't trust
+an FPS regression measured in this environment as a signal about real-world
+performance without checking `WEBGL_debug_renderer_info` first — isolate
+which feature costs what (toggle it off, re-measure) rather than reverting
+based on a sandboxed number alone.
+
 ## Local dev server
 
 The user often already has `npm run dev` (`wrangler dev`, port 8787) running
