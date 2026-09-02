@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>box3d-wasm determinism test</title>
+  <link rel="stylesheet" href="/css/style.css" />
+  <style>
+    .container { max-width: 640px; }
+    #results {
+      text-align: left;
+      background: #1e202b;
+      border: 1px solid #444;
+      border-radius: 8px;
+      padding: 1rem;
+      margin-top: 1rem;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 0.85rem;
+      white-space: pre-wrap;
+      word-break: break-all;
+      display: none;
+    }
+    #headline {
+      text-align: left;
+      margin-top: 1rem;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 1rem;
+      word-break: break-all;
+      display: none;
+    }
+    .row { margin-bottom: 0.35rem; }
+    .row .t { color: #8a8fbf; display: inline-block; width: 3.5rem; }
+    button + button { margin-left: 0.5rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>box3d-wasm determinism test</h1>
+    <p id="status-msg">
+      Runs a fixed physics scene for 600 steps (10 simulated seconds at a
+      1/60s fixed timestep, using <code>world.step(1/60, 4)</code> every
+      call — not wall-clock time, so this is fair to compare across devices
+      of very different speeds). Hashes the full body state once per
+      simulated second. Run this on each device/browser you want to test,
+      then compare the hash lists — they must match exactly, character for
+      character, or the physics is not deterministic across that pair.
+    </p>
+
+    <button id="run-btn">Run 10s test</button>
+    <button id="copy-btn" style="display:none">Copy results</button>
+
+    <div id="headline"></div>
+    <div id="results"></div>
+  </div>
+
+  <script type="module">
+    // Explicitly import the non-threaded "standard" build rather than the
+    // auto-detecting default export. Thread availability (SharedArrayBuffer,
+    // gated by COOP/COEP headers this app doesn't send) can differ across
+    // browsers, which would silently exercise a different code path on
+    // different devices and confound a determinism comparison.
+    import Box3D from "https://unpkg.com/box3d-wasm@0.2.0/dist/box3d.mjs";
+
+    const runBtn = document.getElementById("run-btn");
+    const copyBtn = document.getElementById("copy-btn");
+    const statusMsg = document.getElementById("status-msg");
+    const headlineEl = document.getElementById("headline");
+    const resultsEl = document.getElementById("results");
+
+    const FIXED_DT = 1 / 60;
+    const SUBSTEPS = 4;
+    const STEPS_PER_SECOND = 60;
+    const TOTAL_SECONDS = 10;
+
+    async function sha256Hex(bytes) {
+      const digest = await crypto.subtle.digest("SHA-256", bytes);
+      return [...new Uint8Array(digest)]
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+    }
+
+    function snapshotBytes(bodies) {
+      // 3 pos + 4 rot floats per body, in fixed creation order (not
+      // engine-internal array order, which is free to differ).
+      const buf = new Float64Array(bodies.length * 7);
+      let i = 0;
+      for (const body of bodies) {
+        const p = body.getPosition();
+        const r = body.getRotation();
+        buf[i++] = p.x; buf[i++] = p.y; buf[i++] = p.z;
+        buf[i++] = r.x; buf[i++] = r.y; buf[i++] = r.z; buf[i++] = r.w;
+      }
+      return new Uint8Array(buf.buffer);
+    }
+
+    function buildScene(b3) {
+      const world = new b3.World({ gravity: { x: 0, y: -10, z: 0 } });
+
+      const ground = world.createBody({
+        type: "static",
+        position: { x: 0, y: -0.5, z: 0 },
+      });
+      ground.createBox({ halfExtents: { x: 20, y: 0.5, z: 20 } });
+
+      // A small raised static platform so spheres roll off an edge and
+      // collide with each other on the way down, not just free-fall —
+      // exercises static contact, dynamic-dynamic contact, and rolling
+      // friction, not just gravity integration.
+      const platform = world.createBody({
+        type: "static",
+        position: { x: 0, y: 1, z: 0 },
+      });
+      platform.createBox({ halfExtents: { x: 3, y: 0.25, z: 3 } });
+
+      const bodies = [];
+      // Fixed, hardcoded spawn grid — no Math.random, so every device
+      // starts from an identical scene.
+      const spawns = [
+        { x: -0.6, y: 4, z: -0.6 },
+        { x: 0.6, y: 4.3, z: -0.6 },
+        { x: -0.6, y: 4.6, z: 0.6 },
+        { x: 0.6, y: 4.9, z: 0.6 },
+        { x: 0, y: 5.5, z: 0 },
+      ];
+      for (const pos of spawns) {
+        const sphere = world.createBody({ type: "dynamic", position: pos });
+        sphere.createSphere({ radius: 0.4 });
+        bodies.push(sphere);
+      }
+
+      return { world, bodies };
+    }
+
+    async function runTest() {
+      runBtn.disabled = true;
+      copyBtn.style.display = "none";
+      headlineEl.style.display = "none";
+      resultsEl.style.display = "none";
+      resultsEl.textContent = "";
+      statusMsg.textContent = "Loading box3d-wasm...";
+
+      try {
+        const b3 = await Box3D();
+        statusMsg.textContent = "Running fixed-step simulation...";
+
+        const { world, bodies } = buildScene(b3);
+        // b3.threaded is the library's own report of which build it picked
+        // (standard vs deluxe) — more authoritative than inferring it from
+        // SharedArrayBuffer availability. Should read false here since we
+        // imported box3d-wasm/standard directly rather than the
+        // auto-detecting default export.
+
+        const perSecond = [];
+        for (let sec = 1; sec <= TOTAL_SECONDS; sec++) {
+          for (let s = 0; s < STEPS_PER_SECOND; s++) {
+            world.step(FIXED_DT, SUBSTEPS);
+          }
+          const hash = await sha256Hex(snapshotBytes(bodies));
+          perSecond.push(hash);
+        }
+
+        // One combined hash over the whole per-second trace, so a quick
+        // eyeball match/mismatch doesn't require scanning all 10 lines —
+        // the full list below is what tells you *when* it diverged.
+        const traceBytes = new TextEncoder().encode(perSecond.join("|"));
+        const overall = await sha256Hex(traceBytes);
+
+        world.destroy();
+
+        const ua = navigator.userAgent;
+        const platform = navigator.platform || "(unknown)";
+        const cores = navigator.hardwareConcurrency || "(unknown)";
+
+        headlineEl.textContent = `overall: ${overall}`;
+        headlineEl.style.display = "block";
+
+        const lines = [];
+        lines.push(`device: ${platform}, ${cores} cores, box3d threaded=${b3.threaded}`);
+        lines.push(`userAgent: ${ua}`);
+        lines.push("");
+        perSecond.forEach((h, idx) => {
+          lines.push(`t=${idx + 1}s  ${h}`);
+        });
+        resultsEl.textContent = lines.join("\n");
+        resultsEl.style.display = "block";
+        copyBtn.style.display = "inline-block";
+        copyBtn.dataset.report = `overall: ${overall}\n${lines.join("\n")}`;
+
+        statusMsg.textContent = "Done. Compare this device's hashes against another device's.";
+      } catch (err) {
+        statusMsg.textContent = `Failed: ${err.message || err}`;
+        console.error(err);
+      } finally {
+        runBtn.disabled = false;
+      }
+    }
+
+    runBtn.addEventListener("click", runTest);
+    copyBtn.addEventListener("click", async () => {
+      await navigator.clipboard.writeText(copyBtn.dataset.report || "");
+      copyBtn.textContent = "Copied!";
+      setTimeout(() => (copyBtn.textContent = "Copy results"), 1500);
+    });
+  </script>
+</body>
+</html>
