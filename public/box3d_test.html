@@ -37,16 +37,18 @@
   <div class="container">
     <h1>box3d-wasm determinism test</h1>
     <p id="status-msg">
-      Runs a fixed physics scene for 600 steps (10 simulated seconds at a
+      Runs a fixed physics scene for 1200 steps (20 simulated seconds at a
       1/60s fixed timestep, using <code>world.step(1/60, 4)</code> every
       call — not wall-clock time, so this is fair to compare across devices
-      of very different speeds). Hashes the full body state once per
+      of very different speeds). A spinning kinematic paddle keeps every
+      body awake and colliding for the full 20s instead of settling to a
+      static rest state early on. Hashes the full body state once per
       simulated second. Run this on each device/browser you want to test,
       then compare the hash lists — they must match exactly, character for
       character, or the physics is not deterministic across that pair.
     </p>
 
-    <button id="run-btn">Run 10s test</button>
+    <button id="run-btn">Run 20s test</button>
     <button id="copy-btn" style="display:none">Copy results</button>
 
     <div id="headline"></div>
@@ -70,7 +72,7 @@
     const FIXED_DT = 1 / 60;
     const SUBSTEPS = 4;
     const STEPS_PER_SECOND = 60;
-    const TOTAL_SECONDS = 10;
+    const TOTAL_SECONDS = 20;
 
     async function sha256Hex(bytes) {
       const digest = await crypto.subtle.digest("SHA-256", bytes);
@@ -112,19 +114,38 @@
       });
       platform.createBox({ halfExtents: { x: 3, y: 0.25, z: 3 } });
 
+      // A kinematic paddle spinning at a fixed angular velocity, sitting
+      // right at resting-sphere height on the platform. Kinematic bodies
+      // aren't affected by contacts, so it never stops — it keeps batting
+      // spheres around (some clean off the platform into open free-fall)
+      // for the entire run instead of everything settling to sleep after
+      // a couple of seconds, which would leave most of the 20s window
+      // trivially frozen-identical and untested.
+      const paddle = world.createBody({
+        type: "kinematic",
+        position: { x: 0, y: 1.65, z: 0 },
+      });
+      paddle.createBox({ halfExtents: { x: 2.2, y: 0.15, z: 0.3 }, friction: 0.4 });
+      paddle.setAngularVelocity({ x: 0, y: 1.6, z: 0 });
+
       const bodies = [];
       // Fixed, hardcoded spawn grid — no Math.random, so every device
-      // starts from an identical scene.
-      const spawns = [
-        { x: -0.6, y: 4, z: -0.6 },
-        { x: 0.6, y: 4.3, z: -0.6 },
-        { x: -0.6, y: 4.6, z: 0.6 },
-        { x: 0.6, y: 4.9, z: 0.6 },
-        { x: 0, y: 5.5, z: 0 },
-      ];
+      // starts from an identical scene. A tighter, denser cluster than a
+      // simple determinism smoke test needs, so bodies collide with each
+      // other (order-sensitive contact resolution) as well as the paddle.
+      const spawns = [];
+      for (let ix = -1; ix <= 1; ix++) {
+        for (let iz = -1; iz <= 1; iz++) {
+          spawns.push({ x: ix * 0.55, y: 3.5 + (ix + iz) * 0.3, z: iz * 0.55 });
+        }
+      }
+      spawns.push({ x: 0, y: 5.5, z: 0 });
+      spawns.push({ x: 0.3, y: 6, z: 0.3 });
+      spawns.push({ x: -0.3, y: 6.4, z: -0.3 });
+
       for (const pos of spawns) {
         const sphere = world.createBody({ type: "dynamic", position: pos });
-        sphere.createSphere({ radius: 0.4 });
+        sphere.createSphere({ radius: 0.35, restitution: 0.3 });
         bodies.push(sphere);
       }
 
