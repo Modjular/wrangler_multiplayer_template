@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>marble editor prototype</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #1a1c26; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #overlay {
+      position: fixed;
+      top: 1rem;
+      left: 1rem;
+      width: 300px;
+      background: rgba(30, 32, 43, 0.9);
+      border: 1px solid #444;
+      border-radius: 8px;
+      padding: 0.9rem 1rem;
+      color: #eee;
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 0.85rem;
+      line-height: 1.4;
+    }
+    #overlay h1 { margin: 0 0 0.4rem; font-size: 1rem; }
+    #overlay p { margin: 0 0 0.75rem; color: #aaa; }
+    .row { display: flex; gap: 0.4rem; margin-bottom: 0.5rem; flex-wrap: wrap; }
+    button {
+      font-size: 0.85rem;
+      padding: 0.4rem 0.7rem;
+      border-radius: 6px;
+      border: 1px solid #444;
+      background: #2a2d3a;
+      color: #eee;
+      cursor: pointer;
+    }
+    button:hover { background: #363a4a; }
+    button.active { background: #5865f2; border-color: #5865f2; }
+    #play-btn { background: #2e7d4f; border-color: #2e7d4f; }
+    #play-btn:hover { background: #35935b; }
+    #play-btn.editing { background: #5865f2; border-color: #5865f2; }
+    #play-btn.editing:hover { background: #4752c4; }
+    #status { color: #8a8fbf; font-size: 0.8rem; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="overlay">
+    <h1>marble editor prototype</h1>
+    <p>
+      Click the ground to place the selected piece on a 1-unit grid.
+      Editor mode never touches physics — pieces just sit where you put
+      them until you hit Play, which instantiates real bodies for
+      anything new and starts stepping. Switching back to Edit only
+      pauses; nothing resets.
+    </p>
+    <div class="row">
+      <button id="tool-chute" class="active">Chute (1×1×4)</button>
+      <button id="tool-cube">Cube (1×1×1)</button>
+      <button id="tool-marble">Marble</button>
+    </div>
+    <div class="row">
+      <button id="rotate-btn">Rotate chute (R)</button>
+    </div>
+    <div class="row">
+      <button id="play-btn">▶ Play</button>
+      <button id="clear-btn">Clear all</button>
+    </div>
+    <div id="status">Loading physics…</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.169.0/build/three.module.js";
+    import Box3D from "https://unpkg.com/box3d-wasm@0.2.0/dist/box3d.mjs";
+
+    const canvas = document.getElementById("canvas");
+    const statusEl = document.getElementById("status");
+    const toolBtns = {
+      chute: document.getElementById("tool-chute"),
+      cube: document.getElementById("tool-cube"),
+      marble: document.getElementById("tool-marble"),
+    };
+    const rotateBtn = document.getElementById("rotate-btn");
+    const playBtn = document.getElementById("play-btn");
+    const clearBtn = document.getElementById("clear-btn");
+
+    // ---- three.js scene (same look as the earlier ramp prototype) ----
+    const BG_COLOR = 0x1a1c26;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(BG_COLOR);
+    scene.fog = new THREE.Fog(BG_COLOR, 14, 40);
+
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(7, 7, 9);
+    camera.lookAt(0, 1, 0);
+
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.1;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    scene.add(new THREE.HemisphereLight(0x8fa8c7, 0x30281f, 0.7));
+    const dirLight = new THREE.DirectionalLight(0xfff1d8, 1.1);
+    dirLight.position.set(6, 12, 6);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(1024, 1024);
+    dirLight.shadow.bias = -0.0015;
+    Object.assign(dirLight.shadow.camera, { left: -8, right: 8, top: 8, bottom: -8, near: 1, far: 40 });
+    scene.add(dirLight);
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    const GROUND_HALF = { x: 6, y: 0.5, z: 6 };
+    const groundMesh = new THREE.Mesh(
+      new THREE.BoxGeometry(GROUND_HALF.x * 2, GROUND_HALF.y * 2, GROUND_HALF.z * 2),
+      new THREE.MeshStandardMaterial({ color: 0x2a2d3a })
+    );
+    groundMesh.position.set(0, -0.5, 0);
+    groundMesh.receiveShadow = true;
+    scene.add(groundMesh);
+    scene.add(new THREE.GridHelper(GROUND_HALF.x * 2, GROUND_HALF.x * 2, 0x44485a, 0x333644).translateY(0.01));
+
+    const WALL_DEFS = [
+      [{ x: 0, y: 0.5, z: -6.1 }, { x: 6.2, y: 1, z: 0.2 }],
+      [{ x: 0, y: 0.5, z: 6.1 }, { x: 6.2, y: 1, z: 0.2 }],
+      [{ x: 6.1, y: 0.5, z: 0 }, { x: 0.2, y: 1, z: 6.2 }],
+      [{ x: -6.1, y: 0.5, z: 0 }, { x: 0.2, y: 1, z: 6.2 }],
+    ];
+    for (const [position, halfExtents] of WALL_DEFS) {
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(halfExtents.x * 2, halfExtents.y * 2, halfExtents.z * 2),
+        new THREE.MeshStandardMaterial({ color: 0x333644, transparent: true, opacity: 0.35 })
+      );
+      mesh.position.set(position.x, position.y, position.z);
+      scene.add(mesh);
+    }
+
+    // ---- faceted half-pipe chute: box3d-wasm has no boolean/CSG shape
+    // op, so the "cut a groove down a 1x1x4 cube" is approximated with
+    // several thin tangent boxes arranged around an arc -- a compound
+    // trough made of primitives rather than a single carved shape.
+    // Verified against the real package before wiring up rendering: a
+    // marble dropped at the high end of a tilted chute built this way
+    // rolls the full length and stays centered, no falling through gaps
+    // between facets.
+    const CHUTE_RADIUS = 0.4;
+    const CHUTE_ARCH_DEG = 150;
+    const CHUTE_SEGMENTS = 6;
+    const CHUTE_LENGTH = 4;
+    const CHUTE_THICKNESS = 0.1;
+    const CHUTE_Y_OFFSET = 0.02; // lift slightly off the ground, purely cosmetic
+
+    function buildChuteSegmentDefs() {
+      const halfLen = CHUTE_LENGTH / 2;
+      const thetaMax = ((CHUTE_ARCH_DEG / 2) * Math.PI) / 180;
+      const dTheta = (2 * thetaMax) / CHUTE_SEGMENTS;
+      const segWidth = CHUTE_RADIUS * dTheta * 1.05; // slight overlap, no gaps between facets
+      const defs = [];
+      for (let i = 0; i < CHUTE_SEGMENTS; i++) {
+        const phi = -thetaMax + (i + 0.5) * dTheta;
+        defs.push({
+          halfExtents: { x: segWidth / 2, y: CHUTE_THICKNESS / 2, z: halfLen },
+          localPos: new THREE.Vector3(CHUTE_RADIUS * Math.sin(phi), CHUTE_RADIUS - CHUTE_RADIUS * Math.cos(phi), 0),
+          localQuat: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), phi),
+        });
+      }
+      return defs;
+    }
+    const CHUTE_SEGMENT_DEFS = buildChuteSegmentDefs();
+
+    // Shared by both mesh placement and physics body placement, so what
+    // you see and what you collide with can never drift apart.
+    function transformLocal(localPos, localQuat, gridX, gridZ, yawDeg, yOffset = 0) {
+      const yaw = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), (yawDeg * Math.PI) / 180);
+      const worldQuat = yaw.clone().multiply(localQuat);
+      const worldPos = localPos.clone().applyQuaternion(yaw).add(new THREE.Vector3(gridX, yOffset, gridZ));
+      return { worldPos, worldQuat };
+    }
+
+    const MARBLE_RADIUS = 0.3;
+    const MARBLE_HOVER_Y = 1.8;
+
+    function buildMeshGroup(type, gridX, gridZ, yawDeg, { ghost = false } = {}) {
+      const group = new THREE.Group();
+      const mat = (color) =>
+        new THREE.MeshStandardMaterial(ghost ? { color, transparent: true, opacity: 0.35 } : { color });
+
+      if (type === "chute") {
+        for (const seg of CHUTE_SEGMENT_DEFS) {
+          const { worldPos, worldQuat } = transformLocal(seg.localPos, seg.localQuat, gridX, gridZ, yawDeg, CHUTE_Y_OFFSET);
+          const mesh = new THREE.Mesh(
+            new THREE.BoxGeometry(seg.halfExtents.x * 2, seg.halfExtents.y * 2, seg.halfExtents.z * 2),
+            mat(0x6b7099)
+          );
+          mesh.position.copy(worldPos);
+          mesh.quaternion.copy(worldQuat);
+          mesh.castShadow = !ghost;
+          mesh.receiveShadow = true;
+          group.add(mesh);
+        }
+      } else if (type === "cube") {
+        const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), mat(0x4a4d63));
+        mesh.position.set(gridX, 0.5, gridZ);
+        mesh.castShadow = !ghost;
+        mesh.receiveShadow = true;
+        group.add(mesh);
+      } else if (type === "marble") {
+        const mesh = new THREE.Mesh(new THREE.SphereGeometry(MARBLE_RADIUS, 24, 16), mat(0xf2a35c));
+        mesh.position.set(gridX, MARBLE_HOVER_Y, gridZ);
+        mesh.castShadow = !ghost;
+        mesh.receiveShadow = true;
+        group.add(mesh);
+      }
+      return group;
+    }
+
+    // ---- physics ----
+    statusEl.textContent = "Loading physics…";
+    const b3 = await Box3D();
+    const world = new b3.World({ gravity: { x: 0, y: -10, z: 0 } });
+    world.createBody({ type: "static", position: { x: 0, y: -0.5, z: 0 } }).createBox({ halfExtents: GROUND_HALF });
+    for (const [position, halfExtents] of WALL_DEFS) {
+      world.createBody({ type: "static", position }).createBox({ halfExtents });
+    }
+
+    // ---- prop lifecycle: placeProp() only ever creates the (already
+    // final-position) mesh. physicalizeProp() is the only thing that
+    // creates real box3d bodies, and it's only ever called when entering
+    // Play mode -- editor mode is pure data + visuals, no physics. ----
+    let nextId = 1;
+    const props = [];
+    const liveMarbles = []; // { body, mesh } -- only dynamic bodies need per-frame sync
+
+    function placeProp(type, gridX, gridZ, yawDeg) {
+      const mesh = buildMeshGroup(type, gridX, gridZ, yawDeg);
+      scene.add(mesh);
+      const prop = { id: nextId++, type, gridX, gridZ, yawDeg, mesh, bodies: [], isPhysical: false };
+      props.push(prop);
+      return prop;
+    }
+
+    function physicalizeProp(prop) {
+      if (prop.isPhysical) return;
+      const { type, gridX, gridZ, yawDeg } = prop;
+      if (type === "chute") {
+        for (const seg of CHUTE_SEGMENT_DEFS) {
+          const { worldPos, worldQuat } = transformLocal(seg.localPos, seg.localQuat, gridX, gridZ, yawDeg, CHUTE_Y_OFFSET);
+          const body = world.createBody({
+            type: "static",
+            position: { x: worldPos.x, y: worldPos.y, z: worldPos.z },
+            rotation: { x: worldQuat.x, y: worldQuat.y, z: worldQuat.z, w: worldQuat.w },
+          });
+          body.createBox({ halfExtents: seg.halfExtents, friction: 0.4 });
+          prop.bodies.push(body);
+        }
+      } else if (type === "cube") {
+        const body = world.createBody({ type: "static", position: { x: gridX, y: 0.5, z: gridZ } });
+        body.createBox({ halfExtents: { x: 0.5, y: 0.5, z: 0.5 }, friction: 0.5 });
+        prop.bodies.push(body);
+      } else if (type === "marble") {
+        const body = world.createBody({ type: "dynamic", position: { x: gridX, y: MARBLE_HOVER_Y, z: gridZ } });
+        body.createSphere({ radius: MARBLE_RADIUS, friction: 0.4, restitution: 0.1 });
+        prop.bodies.push(body);
+        liveMarbles.push({ body, mesh: prop.mesh.children[0] });
+      }
+      prop.isPhysical = true;
+    }
+
+    function clearAll() {
+      for (const prop of props) {
+        for (const body of prop.bodies) body.destroy();
+        scene.remove(prop.mesh);
+      }
+      props.length = 0;
+      liveMarbles.length = 0;
+      enterEditMode();
+      placeProp("chute", 0, 0, 0); // restore the initial scene
+    }
+
+    placeProp("chute", 0, 0, 0);
+    statusEl.textContent = "Editing — click the ground to place.";
+
+    // ---- editor state: tool, yaw, ghost preview ----
+    let currentTool = "chute";
+    let currentYawDeg = 0;
+    let mode = "edit"; // "edit" | "play"
+
+    let ghostGroup = null;
+    function refreshGhost(gridX, gridZ) {
+      if (ghostGroup) scene.remove(ghostGroup);
+      if (mode !== "edit") { ghostGroup = null; return; }
+      ghostGroup = buildMeshGroup(currentTool, gridX, gridZ, currentYawDeg, { ghost: true });
+      scene.add(ghostGroup);
+    }
+    let lastGhostGrid = { x: 0, z: 2 };
+    refreshGhost(lastGhostGrid.x, lastGhostGrid.z);
+
+    function setTool(tool) {
+      currentTool = tool;
+      for (const [name, btn] of Object.entries(toolBtns)) btn.classList.toggle("active", name === tool);
+      refreshGhost(lastGhostGrid.x, lastGhostGrid.z);
+    }
+    toolBtns.chute.addEventListener("click", () => setTool("chute"));
+    toolBtns.cube.addEventListener("click", () => setTool("cube"));
+    toolBtns.marble.addEventListener("click", () => setTool("marble"));
+
+    function rotate() {
+      currentYawDeg = (currentYawDeg + 90) % 360;
+      refreshGhost(lastGhostGrid.x, lastGhostGrid.z);
+    }
+    rotateBtn.addEventListener("click", rotate);
+
+    function enterPlayMode() {
+      for (const prop of props) physicalizeProp(prop);
+      mode = "play";
+      if (ghostGroup) { scene.remove(ghostGroup); ghostGroup = null; }
+      playBtn.textContent = "✏ Edit";
+      playBtn.classList.add("editing");
+      statusEl.textContent = "Playing — physics is live.";
+    }
+    function enterEditMode() {
+      mode = "edit";
+      playBtn.textContent = "▶ Play";
+      playBtn.classList.remove("editing");
+      statusEl.textContent = "Editing — click the ground to place.";
+      refreshGhost(lastGhostGrid.x, lastGhostGrid.z);
+    }
+    playBtn.addEventListener("click", () => (mode === "edit" ? enterPlayMode() : enterEditMode()));
+    clearBtn.addEventListener("click", clearAll);
+
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "r" || e.key === "R") rotate();
+      else if (e.key === "1") setTool("chute");
+      else if (e.key === "2") setTool("cube");
+      else if (e.key === "3") setTool("marble");
+    });
+
+    // ---- raycast placement ----
+    const raycaster = new THREE.Raycaster();
+    const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    const GRID_LIMIT = 5;
+    function pointerToGrid(event) {
+      const rect = canvas.getBoundingClientRect();
+      const ndc = new THREE.Vector2(
+        ((event.clientX - rect.left) / rect.width) * 2 - 1,
+        -((event.clientY - rect.top) / rect.height) * 2 + 1
+      );
+      raycaster.setFromCamera(ndc, camera);
+      const hit = new THREE.Vector3();
+      if (!raycaster.ray.intersectPlane(groundPlane, hit)) return null;
+      return {
+        x: Math.max(-GRID_LIMIT, Math.min(GRID_LIMIT, Math.round(hit.x))),
+        z: Math.max(-GRID_LIMIT, Math.min(GRID_LIMIT, Math.round(hit.z))),
+      };
+    }
+
+    canvas.addEventListener("pointermove", (e) => {
+      if (mode !== "edit") return;
+      const grid = pointerToGrid(e);
+      if (!grid) return;
+      lastGhostGrid = { x: grid.x, z: grid.z };
+      refreshGhost(grid.x, grid.z);
+    });
+    canvas.addEventListener("pointerdown", (e) => {
+      if (mode !== "edit") return;
+      const grid = pointerToGrid(e);
+      if (!grid) return;
+      placeProp(currentTool, grid.x, grid.z, currentYawDeg);
+    });
+
+    // ---- fixed-timestep physics (only while playing), real-time render ----
+    const PHYSICS_DT = 1 / 60;
+    let accumulator = 0;
+    let lastTime = performance.now() / 1000;
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const now = performance.now() / 1000;
+      const frameTime = Math.min(now - lastTime, 0.25);
+      lastTime = now;
+
+      if (mode === "play") {
+        accumulator += frameTime;
+        while (accumulator >= PHYSICS_DT) {
+          world.step(PHYSICS_DT, 4);
+          accumulator -= PHYSICS_DT;
+        }
+        for (const { body, mesh } of liveMarbles) {
+          const p = body.getPosition();
+          const r = body.getRotation();
+          mesh.position.set(p.x, p.y, p.z);
+          mesh.quaternion.set(r.x, r.y, r.z, r.w);
+        }
+      } else {
+        accumulator = 0;
+      }
+
+      renderer.render(scene, camera);
+    }
+    animate();
+  </script>
+</body>
+</html>
