@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>marble physics prototype</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #1a1c26; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    #overlay {
+      position: fixed;
+      top: 1rem;
+      left: 1rem;
+      max-width: 320px;
+      background: rgba(30, 32, 43, 0.85);
+      border: 1px solid #444;
+      border-radius: 8px;
+      padding: 0.9rem 1rem;
+      color: #eee;
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 0.85rem;
+      line-height: 1.4;
+    }
+    #overlay h1 { margin: 0 0 0.5rem; font-size: 1rem; }
+    #overlay p { margin: 0 0 0.75rem; color: #aaa; }
+    #reset-btn {
+      font-size: 0.9rem;
+      padding: 0.4rem 0.9rem;
+      border-radius: 6px;
+      border: none;
+      background: #5865f2;
+      color: white;
+      cursor: pointer;
+    }
+    #reset-btn:hover { background: #4752c4; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="overlay">
+    <h1>marble physics prototype</h1>
+    <p>
+      Throwaway, single-player, no networking — just box3d-wasm's physics
+      output rendered directly onto a three.js mesh, to prove the two fit
+      together before any lockstep/multiplayer wiring.
+    </p>
+    <button id="reset-btn">Drop another marble</button>
+  </div>
+
+  <script type="module">
+    import * as THREE from "https://unpkg.com/three@0.169.0/build/three.module.js";
+    // Same non-threaded "standard" build used in the determinism test —
+    // this prototype doesn't need it (no cross-client sync here), but
+    // there's no reason to pull in the auto-detecting/threaded path either.
+    import Box3D from "https://unpkg.com/box3d-wasm@0.2.0/dist/box3d.mjs";
+
+    const canvas = document.getElementById("canvas");
+    const resetBtn = document.getElementById("reset-btn");
+
+    // ---- three.js scene, styled to roughly match the real game's look
+    // (public/js/game.js) at a fraction of the setup ----
+    const BG_COLOR = 0x1a1c26;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(BG_COLOR);
+    scene.fog = new THREE.Fog(BG_COLOR, 14, 40);
+
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(9, 8, 12);
+    camera.lookAt(0, 1, 0);
+
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.1;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    scene.add(new THREE.HemisphereLight(0x8fa8c7, 0x30281f, 0.7));
+    const dirLight = new THREE.DirectionalLight(0xfff1d8, 1.1);
+    dirLight.position.set(6, 12, 6);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(1024, 1024);
+    dirLight.shadow.bias = -0.0015;
+    Object.assign(dirLight.shadow.camera, { left: -12, right: 12, top: 12, bottom: -12, near: 1, far: 40 });
+    scene.add(dirLight);
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    function addBoxMesh(halfExtents, color, { shadow = true } = {}) {
+      const mesh = new THREE.Mesh(
+        new THREE.BoxGeometry(halfExtents.x * 2, halfExtents.y * 2, halfExtents.z * 2),
+        new THREE.MeshStandardMaterial({ color })
+      );
+      mesh.castShadow = shadow;
+      mesh.receiveShadow = true;
+      scene.add(mesh);
+      return mesh;
+    }
+
+    // ---- physics + matching visuals ----
+    // Fixed scene, hardcoded numbers, all verified against the real
+    // installed package before writing this: ramp tilted 25deg about X,
+    // positioned so its low end meets the ground and its high end is
+    // where the marble spawns; four walls bound the ground so the marble
+    // stays in view instead of rolling off into open space forever.
+    const b3 = await Box3D();
+    const world = new b3.World({ gravity: { x: 0, y: -10, z: 0 } });
+
+    const groundHalf = { x: 10, y: 0.5, z: 10 };
+    world.createBody({ type: "static", position: { x: 0, y: -0.5, z: 0 } }).createBox({ halfExtents: groundHalf });
+    const groundMesh = addBoxMesh(groundHalf, 0x2a2d3a);
+    groundMesh.position.set(0, -0.5, 0);
+
+    const rampAngle = (25 * Math.PI) / 180;
+    const rampQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), rampAngle);
+    const rampHalf = { x: 0.6, y: 0.1, z: 3 };
+    const rampPos = { x: 0, y: 1.568, z: 0 };
+    world.createBody({ type: "static", position: rampPos, rotation: rampQuat }).createBox({
+      halfExtents: rampHalf,
+      friction: 0.5,
+    });
+    const rampMesh = addBoxMesh(rampHalf, 0x4a4d63);
+    rampMesh.position.set(rampPos.x, rampPos.y, rampPos.z);
+    rampMesh.quaternion.copy(rampQuat);
+
+    const wallDefs = [
+      [{ x: 0, y: 0.5, z: -10.1 }, { x: 10.2, y: 1, z: 0.2 }],
+      [{ x: 0, y: 0.5, z: 10.1 }, { x: 10.2, y: 1, z: 0.2 }],
+      [{ x: 10.1, y: 0.5, z: 0 }, { x: 0.2, y: 1, z: 10.2 }],
+      [{ x: -10.1, y: 0.5, z: 0 }, { x: 0.2, y: 1, z: 10.2 }],
+    ];
+    for (const [position, halfExtents] of wallDefs) {
+      world.createBody({ type: "static", position }).createBox({ halfExtents });
+      const mesh = addBoxMesh(halfExtents, 0x333644, { shadow: false });
+      mesh.position.set(position.x, position.y, position.z);
+      mesh.material.transparent = true;
+      mesh.material.opacity = 0.35;
+    }
+
+    const MARBLE_SPAWN = { x: 0.05, y: 3.836, z: -2.7 };
+    const MARBLE_RADIUS = 0.3;
+    const marbleMesh = new THREE.Mesh(
+      new THREE.SphereGeometry(MARBLE_RADIUS, 24, 16),
+      new THREE.MeshStandardMaterial({ color: 0xf2a35c, roughness: 0.35, metalness: 0.1 })
+    );
+    marbleMesh.castShadow = true;
+    marbleMesh.receiveShadow = true;
+    scene.add(marbleMesh);
+
+    let marbleBody = null;
+    function spawnMarble() {
+      if (marbleBody) marbleBody.destroy();
+      marbleBody = world.createBody({ type: "dynamic", position: MARBLE_SPAWN });
+      marbleBody.createSphere({ radius: MARBLE_RADIUS, friction: 0.5, restitution: 0.1 });
+    }
+    spawnMarble();
+    resetBtn.addEventListener("click", spawnMarble);
+
+    // ---- fixed-timestep physics loop, real-time render loop ----
+    // No lockstep concerns here (single player, nothing to keep in sync
+    // with), so a simple time-accumulator is enough rather than the fixed
+    // 20Hz tick the real game uses.
+    const PHYSICS_DT = 1 / 60;
+    let accumulator = 0;
+    let lastTime = performance.now() / 1000;
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const now = performance.now() / 1000;
+      const frameTime = Math.min(now - lastTime, 0.25);
+      lastTime = now;
+      accumulator += frameTime;
+      while (accumulator >= PHYSICS_DT) {
+        world.step(PHYSICS_DT, 4);
+        accumulator -= PHYSICS_DT;
+      }
+
+      const p = marbleBody.getPosition();
+      const r = marbleBody.getRotation();
+      marbleMesh.position.set(p.x, p.y, p.z);
+      marbleMesh.quaternion.set(r.x, r.y, r.z, r.w);
+
+      renderer.render(scene, camera);
+    }
+    animate();
+  </script>
+</body>
+</html>
